@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+traces/attack_traces.jsonl
+evaluation/results/*.csv
+evaluation/results/*.json
+*.egg-info/
+.DS_Store
