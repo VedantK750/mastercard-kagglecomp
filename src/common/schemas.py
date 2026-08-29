@@ -78,6 +78,7 @@ class ExternalContentItem(BaseModel):
 # ---------------------------------------------------------------------------
 
 class DelegationEdge(BaseModel):
+    edge_id: str
     from_agent: str
     to_agent: str
     allowed_categories: List[str]
@@ -185,6 +186,8 @@ SubAttackLiteral = Optional[
         "intent_drift",
         "context_poisoning",
         "cross_agent_injection",
+        "delegation_scope_violation",
+        "ambiguous_catalog",
     ]
 ]
 
