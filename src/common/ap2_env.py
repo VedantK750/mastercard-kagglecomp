@@ -164,7 +164,7 @@ class ShoppingAgent:
             ],
             model=self.model,
             temperature=temperature,
-            max_tokens=500,
+            max_tokens=700,
         )
         chosen = _match_id_in_text(raw, [p.product_id for p in candidates])
         chosen = next((p for p in candidates if p.product_id == chosen), None)
@@ -198,7 +198,7 @@ class ShoppingAgent:
             ],
             model=self.model,
             temperature=temperature,
-            max_tokens=300,
+            max_tokens=500,
         )
         known_user_ids = list(credentials_provider.credential_store.keys())
         requested_user_id = _match_id_in_text(raw, known_user_ids) or session_user_id
