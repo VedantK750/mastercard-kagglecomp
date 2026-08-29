@@ -30,11 +30,11 @@ Two papers ground this system directly:
 | `reasoning_attack` | 1.A.3 Intent drift via injection | payment_manipulation | extends 1.A.1 (shares `IntentMatchScore`) | ⏳ planned |
 | `reasoning_attack` | 1.A.4 Context poisoning | payment_manipulation / data_exposure | Whispers of Wealth future work | ⏳ planned |
 | `reasoning_attack` | 1.A.5 Cross-agent injection | payment_manipulation / data_exposure | Whispers of Wealth future work | ⏳ planned |
-| `intent_manipulation` | 1.C Intent manipulation (no injection) | payment_manipulation | catalog/reasoning ambiguity, not adversarial content | ⏳ planned |
-| `delegation_abuse` | 1.D Delegation / authorization abuse | payment_manipulation | Protocol-Level Attacks, RC-1/RC-2/RC-4/RC-5 | ⏳ planned |
-| `sequence_anomaly` | Agent credential / ATO (preset `credential_ato`) | payment_manipulation | merged family — see note below | ⏳ planned |
-| `sequence_anomaly` | Low-and-slow (preset `low_and_slow`) | payment_manipulation | merged family | ⏳ planned |
-| `sequence_anomaly` | Sequence manipulation (preset `sequence_shift`) | payment_manipulation | merged family | ⏳ planned |
+| `intent_manipulation` | 1.C Intent manipulation (no injection) | payment_manipulation | catalog/reasoning ambiguity, not adversarial content | ✅ built |
+| `delegation_abuse` | 1.D Delegation / authorization abuse | payment_manipulation | Protocol-Level Attacks, RC-2/RC-4/RC-5 | ✅ built |
+| `sequence_anomaly` | Agent credential / ATO (preset `credential_ato`) | payment_manipulation | merged family — see note below | ✅ built |
+| `sequence_anomaly` | Low-and-slow (preset `low_and_slow`) | payment_manipulation | merged family | ✅ built |
+| `sequence_anomaly` | Sequence manipulation (preset `sequence_shift`) | payment_manipulation | merged family | ✅ built |
 | `multi_agent` | Agent compromise / collusion / propagation | payment_manipulation / data_exposure | Whispers of Wealth future work (cross-agent tampering) | ⏳ stretch |
 | `composite` | Attack Composer (chains families via `composed_of`) | either | e.g. Branded Whisper → scope violation → cash-out | ⏳ stretch |
 
@@ -178,7 +178,7 @@ Every Red generator produces, and every Blue detector consumes, the **same** `At
 | `IntentObject` | `category`, `brand`, `max_amount`, `quantity`, `raw_user_statement` | The user's stated purchase intent. |
 | `Product` | `product_id`, `title`, `description`, `price`, `merchant_id`, `is_malicious` | A catalog candidate; `description` is the Branded Whisper injection surface. |
 | `ExternalContentItem` | `source_url`, `text`, `contains_injection`, `injection_technique`, `hop_index` | Content an agent reads. `hop_index` marks which AP2 agent surfaced it (0=Merchant, 1=Shopping, 2=CredentialsProvider, 3=PaymentProcessor). |
-| `DelegationEdge` / `AuthorizationGraph` | `allowed_categories`, `max_amount`, `valid_from/until`, `purpose`, `trust_weight` | The scope a delegated agent is allowed to act within; `trust_weight < 1.0` marks a compromised edge (Multi-Agent). |
+| `DelegationEdge` / `AuthorizationGraph` | `edge_id`, `allowed_categories`, `max_amount`, `valid_from/until`, `purpose`, `trust_weight` | The scope a delegated agent is allowed to act within; `trust_weight < 1.0` marks a compromised edge (Multi-Agent). |
 | `Transaction` | `txn_id`, `agent_id`, `merchant_id`, `amount`, `category`, `executing_authorization_edge` | A single payment execution. |
 | `CredentialState` | enum: `legitimate` / `compromised_unknown` / `compromised_mimic` / `compromised_low_value` / `compromised_escalating` / `compromised_legit_merchant` | Session state for the Sequence Anomaly family. |
 | `RedScore` | `intent_deviation`, `payment_impact`, `realism`, `novelty`, `detection_probability`, `r_red` | Red's own reward: `r_red = intent_deviation × payment_impact × realism × novelty − detection_probability`. |
