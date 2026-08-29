@@ -8,10 +8,11 @@ Run: PYTHONPATH=. .venv/bin/python evaluation/baseline_reproduction.py
 
 from __future__ import annotations
 
+from src.blue_team.reasoning_attack_detector import ReasoningAttackDetector
 from src.common.trace_io import write_traces
 from src.red_team.branded_whisper import BrandedWhisperGenerator
 from src.red_team.vault_whisper import VaultWhisperGenerator
-from evaluation.metrics import success_rate
+from evaluation.metrics import classification_metrics, confusion_breakdown, success_rate
 
 N_TRIALS = 10  # matches the paper's trial count for direct comparability
 
@@ -52,6 +53,12 @@ def main():
     all_traces = benign_traces + bw_attack_traces + vw_attack_traces
     write_traces(all_traces, "traces/attack_traces.jsonl", mode="w")
     print(f"\nWrote {len(all_traces)} traces to traces/attack_traces.jsonl")
+
+    print(f"\n=== ReasoningAttackDetector (Blue) evaluated over all {len(all_traces)} traces ===")
+    detector = ReasoningAttackDetector()
+    verdicts = [detector.evaluate(t) for t in all_traces]
+    print(classification_metrics(all_traces, verdicts))
+    print(confusion_breakdown(all_traces, verdicts))
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import random
 import uuid
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.common.ap2_env import (
     CredentialsProviderAgent,
@@ -84,21 +84,19 @@ class BrandedWhisperGenerator(RedGenerator):
             }
         ]
 
-    def mutate(self, seed_context: Dict[str, Any]) -> Dict[str, Any]:
+    def mutate(self, seed_context: Dict[str, Any], feedback: Optional[str] = None) -> Dict[str, Any]:
         context = dict(seed_context)
         technique = random.choice(INJECTION_TECHNIQUES)
+        prompt = _MUTATE_PROMPT.format(
+            technique=technique, base_description=context["malicious_base_description"]
+        )
+        if feedback:
+            prompt += f"\n\nIMPORTANT — evasion constraint: {feedback}"
         rewritten = chat(
-            messages=[
-                {
-                    "role": "user",
-                    "content": _MUTATE_PROMPT.format(
-                        technique=technique, base_description=context["malicious_base_description"]
-                    ),
-                }
-            ],
+            messages=[{"role": "user", "content": prompt}],
             model=RED_MODEL,
             temperature=0.9,
-            max_tokens=200,
+            max_tokens=450,
         ).strip()
         context["technique"] = technique
         context["injected_description"] = rewritten or context["injected_description"]

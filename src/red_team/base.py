@@ -6,7 +6,7 @@ attack family implements. Concrete generators live one file per family
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from src.common.schemas import AttackTrace
 
@@ -21,8 +21,12 @@ class RedGenerator(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def mutate(self, seed_context: Dict[str, Any]) -> Dict[str, Any]:
-        """Produce one variant context from a seed (or a prior mutation)."""
+    def mutate(self, seed_context: Dict[str, Any], feedback: Optional[str] = None) -> Dict[str, Any]:
+        """Produce one variant context from a seed (or a prior mutation).
+        `feedback`, when given, describes why the previous variant was
+        caught (e.g. which phrases a Blue detector flagged) so the rewrite
+        can deliberately avoid it — this is what turns a plain mutation
+        loop into detector evasion (src/red_team/evasion.py)."""
         raise NotImplementedError
 
     @abstractmethod

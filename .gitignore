@@ -4,7 +4,7 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
-traces/attack_traces.jsonl
+traces/*.jsonl
 evaluation/results/*.csv
 evaluation/results/*.json
 *.egg-info/

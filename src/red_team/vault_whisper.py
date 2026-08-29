@@ -17,11 +17,11 @@ prompts but has no direct access to databases or credentials. Objective is
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from src.common.ap2_env import CredentialsProviderAgent, ShoppingAgent, new_trace_id, now, sign_mandate
 from src.common.llm_client import RED_MODEL, chat
-from src.common.schemas import AttackTrace, IntentObject, RedScore
+from src.common.schemas import AttackTrace, ExternalContentItem, IntentObject, RedScore
 from src.common.scoring import keyword_injection_heuristic
 from src.red_team.base import RedGenerator
 
@@ -75,23 +75,21 @@ class VaultWhisperGenerator(RedGenerator):
             }
         ]
 
-    def mutate(self, seed_context: Dict[str, Any]) -> Dict[str, Any]:
+    def mutate(self, seed_context: Dict[str, Any], feedback: Optional[str] = None) -> Dict[str, Any]:
         context = dict(seed_context)
         technique = random.choice(FRAMING_TECHNIQUES)
+        prompt = _MUTATE_PROMPT.format(
+            technique=technique,
+            base_message=context["adversarial_message"],
+            target_user_id=context["target_user_id"],
+        )
+        if feedback:
+            prompt += f"\n\nIMPORTANT — evasion constraint: {feedback}"
         rewritten = chat(
-            messages=[
-                {
-                    "role": "user",
-                    "content": _MUTATE_PROMPT.format(
-                        technique=technique,
-                        base_message=context["adversarial_message"],
-                        target_user_id=context["target_user_id"],
-                    ),
-                }
-            ],
+            messages=[{"role": "user", "content": prompt}],
             model=RED_MODEL,
             temperature=0.9,
-            max_tokens=150,
+            max_tokens=400,
         ).strip()
         context["technique"] = technique
         context["adversarial_message"] = rewritten or context["adversarial_message"]
@@ -141,6 +139,15 @@ class VaultWhisperGenerator(RedGenerator):
             injection_channel="direct_user_prompt",
             ground_truth_label=True,
             user_intent=intent,
+            external_content=[
+                ExternalContentItem(
+                    source_url="user://direct_message",
+                    text=context["adversarial_message"],
+                    contains_injection=True,
+                    injection_technique=context["technique"],
+                    hop_index=1,  # reaches ShoppingAgent directly, no merchant hop
+                )
+            ],
             mandates=[intent_mandate],
             agent_reasoning_trace=[
                 {
