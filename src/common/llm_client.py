@@ -37,6 +37,27 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 VICTIM_MODEL = os.getenv("VICTIM_MODEL", "gemini-3.1-flash-lite")
 RED_MODEL = os.getenv("RED_MODEL", "gemini-3.1-flash-lite")
 
+# Call accounting — every real Gemini call in the project funnels through
+# chat(), so a module-level counter here gives evaluation/adaptive_loop.py
+# (and anything else) a cheap, exact LLM-call budget for a run, without
+# needing to instrument every call site separately.
+_call_count = 0
+_call_count_by_model: dict[str, int] = {}
+
+
+def get_call_count() -> int:
+    return _call_count
+
+
+def get_call_count_by_model() -> dict[str, int]:
+    return dict(_call_count_by_model)
+
+
+def reset_call_count() -> None:
+    global _call_count
+    _call_count = 0
+    _call_count_by_model.clear()
+
 
 @lru_cache(maxsize=1)
 def get_client() -> OpenAI:
@@ -55,6 +76,7 @@ def chat(
     — that shows up as `message=None`, not a refusal string, so callers must
     already treat empty string as "no usable output" rather than a real
     generation."""
+    global _call_count
     client = get_client()
     resp = client.chat.completions.create(
         model=model,
@@ -62,5 +84,7 @@ def chat(
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    _call_count += 1
+    _call_count_by_model[model] = _call_count_by_model.get(model, 0) + 1
     message = resp.choices[0].message
     return (message.content or "") if message is not None else ""
