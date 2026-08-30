@@ -20,7 +20,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.blue_team.base import Detector
-from src.common.schemas import AttackTrace, BlueVerdict
+from src.common.feedback import AttackMemory
+from src.common.memory import AttackMemoryStore
+from src.common.schemas import AttackTrace, BlueVerdict, RedScore
 from src.common.scoring import attack_succeeded
 from src.red_team.base import RedGenerator
 
@@ -87,6 +89,123 @@ def run_evasion_search(
             f"steering the outcome the same way."
         )
 
+    return result
+
+
+@dataclass
+class GenerationResult:
+    """Output of one run_population_search() call — every candidate
+    produced this generation (caught or evaded, succeeded or failed), plus
+    the surviving parent contexts to hand to the NEXT generation's call."""
+
+    all_traces: List[AttackTrace] = field(default_factory=list)
+    all_verdicts: List[BlueVerdict] = field(default_factory=list)
+    all_memories: List[AttackMemory] = field(default_factory=list)
+    survivors: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def run_population_search(
+    generator: RedGenerator,
+    detector: Detector,
+    memory_store: AttackMemoryStore,
+    seed_context: Dict[str, Any],
+    generation: int,
+    population_size: int = 3,
+    rounds: int = 2,
+    survivors_kept: int = 2,
+    prior_survivors: Optional[List[Dict[str, Any]]] = None,
+    simulate_kwargs: Optional[Dict[str, Any]] = None,
+    max_dedup_retries: int = 2,
+) -> GenerationResult:
+    """The adaptive co-evolution loop's population/generation driver
+    (evaluation/adaptive_loop.py) — unlike run_evasion_search, this NEVER
+    early-exits: it runs the full population x rounds budget every call and
+    returns every candidate produced, so adaptive_loop.py can accumulate a
+    real train/test pool rather than stopping at the first Case C.
+
+    Each round, `population_size` children are mutated from the current
+    parent pool (round 1: from `prior_survivors` if given, else the bare
+    seed; later rounds: from the previous round's top `survivors_kept`
+    parents by measured reward). Every freshly-mutated candidate is checked
+    against `memory_store` before simulate() — a near-duplicate triggers up
+    to `max_dedup_retries` re-mutations with an explicit "too similar, try
+    something genuinely different" nudge; if still a duplicate after
+    retries, it's evaluated anyway (never blocks the loop) but flagged
+    `is_duplicate=True` and excluded from the "distinct evasions" count
+    adaptive_loop.py reports.
+
+    Each candidate's measured reward substitutes verdict.risk_score for
+    Red's own detection_probability prior, and the memory store's measured
+    novelty (1 - max_similarity) for the generator's static novelty prior —
+    see src/common/feedback.py / src/common/memory.py. Selection into the
+    next round's parents ranks purely by this measured reward, descending.
+    """
+    simulate_kwargs = simulate_kwargs or {}
+    result = GenerationResult()
+    parents: List[Dict[str, Any]] = (
+        [dict(p) for p in prior_survivors] if prior_survivors else [dict(seed_context)]
+    )
+
+    for _round_num in range(1, rounds + 1):
+        round_candidates: List[tuple] = []  # (child_context, trace, verdict, memory)
+
+        for i in range(population_size):
+            parent_context = parents[i % len(parents)]
+            feedback = parent_context.get("_last_feedback")
+
+            context = generator.mutate(parent_context, feedback=feedback)
+            text = context.get(generator.text_field) if generator.text_field else None
+            params = generator.searchable_params(context)
+
+            attempts = 0
+            while (
+                memory_store.is_duplicate(generator.family, params, text=text)
+                and attempts < max_dedup_retries
+            ):
+                context = generator.mutate(
+                    parent_context,
+                    feedback="That was too similar to something already tried — "
+                    "produce a genuinely different variant, not a minor rewording.",
+                )
+                text = context.get(generator.text_field) if generator.text_field else None
+                params = generator.searchable_params(context)
+                attempts += 1
+            still_duplicate = memory_store.is_duplicate(generator.family, params, text=text)
+
+            trace = generator.simulate(context, **simulate_kwargs)
+            trace.generation = generation
+            verdict = detector.evaluate(trace)
+
+            novelty = 1.0 - memory_store.max_similarity(generator.family, params, text=text)
+            measured_score = RedScore.compute(
+                intent_deviation=trace.red_score.intent_deviation,
+                payment_impact=trace.red_score.payment_impact,
+                realism=trace.red_score.realism,
+                novelty=novelty,
+                detection_probability=verdict.risk_score,
+            )
+            trace.evasion_rounds = list(parent_context.get("_evasion_rounds", [])) + [measured_score]
+
+            memory = AttackMemory.from_trace_and_verdict(
+                trace, verdict, generation, params, novelty, measured_score.r_red,
+                parent_id=parent_context.get("_trace_id"),
+            )
+            memory.is_duplicate = still_duplicate
+            memory_store.record(memory, params, text=text)
+
+            context["_trace_id"] = trace.trace_id
+            context["_last_feedback"] = memory
+            context["_evasion_rounds"] = trace.evasion_rounds
+
+            round_candidates.append((context, trace, verdict, memory))
+            result.all_traces.append(trace)
+            result.all_verdicts.append(verdict)
+            result.all_memories.append(memory)
+
+        round_candidates.sort(key=lambda c: c[3].reward, reverse=True)
+        parents = [c[0] for c in round_candidates[:survivors_kept]] or parents
+
+    result.survivors = parents
     return result
 
 
