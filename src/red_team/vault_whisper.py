@@ -20,6 +20,7 @@ import random
 from typing import Any, Dict, List, Optional
 
 from src.common.ap2_env import CredentialsProviderAgent, ShoppingAgent, new_trace_id, now, sign_mandate
+from src.common.feedback import feedback_to_constraint_text
 from src.common.llm_client import RED_MODEL, chat
 from src.common.schemas import AttackTrace, ExternalContentItem, IntentObject, RedScore
 from src.common.scoring import keyword_injection_heuristic
@@ -47,6 +48,10 @@ Target user_id to reference (the OTHER account being asked about): {target_user_
 class VaultWhisperGenerator(RedGenerator):
     family = "reasoning_attack"
     sub_attack = "vault_whisper"
+    text_field = "adversarial_message"
+
+    def searchable_params(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        return {"technique": context.get("technique")}
 
     def seed(self) -> List[Dict[str, Any]]:
         return [
@@ -75,7 +80,7 @@ class VaultWhisperGenerator(RedGenerator):
             }
         ]
 
-    def mutate(self, seed_context: Dict[str, Any], feedback: Optional[str] = None) -> Dict[str, Any]:
+    def mutate(self, seed_context: Dict[str, Any], feedback: Optional[Any] = None) -> Dict[str, Any]:
         context = dict(seed_context)
         technique = random.choice(FRAMING_TECHNIQUES)
         prompt = _MUTATE_PROMPT.format(
@@ -83,8 +88,9 @@ class VaultWhisperGenerator(RedGenerator):
             base_message=context["adversarial_message"],
             target_user_id=context["target_user_id"],
         )
-        if feedback:
-            prompt += f"\n\nIMPORTANT — evasion constraint: {feedback}"
+        constraint_text = feedback_to_constraint_text(feedback)
+        if constraint_text:
+            prompt += f"\n\nIMPORTANT — evasion constraint: {constraint_text}"
         rewritten = chat(
             messages=[{"role": "user", "content": prompt}],
             model=RED_MODEL,

@@ -47,6 +47,9 @@ class DelegationAbuseGenerator(RedGenerator):
     family = "delegation_abuse"
     sub_attack = "delegation_scope_violation"
 
+    def searchable_params(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        return {"violation_type": context.get("violation_type")}
+
     def seed(self) -> List[Dict[str, Any]]:
         return [
             {
@@ -60,7 +63,7 @@ class DelegationAbuseGenerator(RedGenerator):
             }
         ]
 
-    def mutate(self, seed_context: Dict[str, Any], feedback: Optional[str] = None) -> Dict[str, Any]:
+    def mutate(self, seed_context: Dict[str, Any], feedback: Optional[Any] = None) -> Dict[str, Any]:
         # Deterministic family — no LLM in the loop, so there's no adversarial
         # phrasing for `feedback` to steer away from. It's accepted only to
         # satisfy the RedGenerator interface evasion.py drives every family
