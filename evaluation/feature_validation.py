@@ -48,8 +48,12 @@ _im_detector = IntentManipulationDetector()
 
 
 def feat_ra_keyword(trace: AttackTrace) -> List[float]:
-    (max_hits, total_hits), _ = _ra_detector._features(trace)
-    return [max_hits, total_hits]
+    # Take only the leading keyword pair: the live detector's _features() has
+    # since grown identity_mismatch as a third entry (accepted in Phase C),
+    # but R1 here is deliberately the PRE-Phase-C baseline this script exists
+    # to measure against, so it must stay the original two features.
+    feats, _ = _ra_detector._features(trace)
+    return list(feats[:2])
 
 
 def feat_ra_identity(trace: AttackTrace) -> List[float]:

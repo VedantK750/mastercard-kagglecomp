@@ -25,3 +25,15 @@ class Detector(ABC):
         state lives on the instance, so it must be constructed once and
         reused across generations, never recreated."""
         return None
+
+    def calibrate(self, null_traces: List[AttackTrace]) -> None:
+        """No-op by default. Detectors with a one-class component override
+        this to fit thresholds on ATTACK-FREE traces only.
+
+        Deliberately separate from fit(): fit() consumes labels and cannot
+        generalize to a strategy absent from its training pool (the
+        coefficient on the deciding feature is unidentified there), whereas
+        calibrate() never sees a label, so an unseen strategy is scored on
+        the same footing as a seen one. Callers must pass only traces with
+        ground_truth_label=False — implementations assert this."""
+        return None

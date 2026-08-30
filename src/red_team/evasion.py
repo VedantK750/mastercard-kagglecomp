@@ -193,6 +193,14 @@ def run_population_search(
             memory.is_duplicate = still_duplicate
             memory_store.record(memory, params, text=text)
 
+            # Lineage ROOT, propagated down every descendant. The train/test
+            # split must hash THIS, not trace_id: a child mutated from its
+            # parent by a +/-5% jitter is near-identical to it (a 92%
+            # duplicate rate was measured for low_and_slow), so a per-trace
+            # hash can put a parent in train and its near-twin in test —
+            # which is training on the test set with extra steps.
+            context["_root_id"] = parent_context.get("_root_id") or trace.trace_id
+            trace.metadata["root_id"] = context["_root_id"]
             context["_trace_id"] = trace.trace_id
             context["_last_feedback"] = memory
             context["_evasion_rounds"] = trace.evasion_rounds

@@ -36,8 +36,9 @@ import hashlib
 import os
 import random
 import statistics
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 from src.blue_team.base import Detector
 from src.blue_team.delegation_abuse_detector import DelegationAbuseDetector
@@ -75,12 +76,32 @@ BREAKDOWN_FIELDS = ["generation", "family", "segment", "n_test", "n_caught", "re
 CSV_FIELDS = [
     "generation", "family", "n_train_pool", "n_test_pool", "red_asr",
     "blue_recall_test", "blue_fpr_test", "case_c_test", "recovered_case_c", "f1_test",
-    "distinct_evasions", "mean_reward", "mean_novelty",
+    "distinct_evasions", "mean_reward", "mean_novelty", "floor_topups",
 ]
+
+# Addendum 3 — stratified replay floor (see plan file). Independent of Red's
+# adaptive search: guarantees each KNOWN segment has at least this many
+# examples in train_pool, regardless of what the live population currently
+# favors. Smaller for LLM-costed families to bound the added budget; free
+# for sequence_anomaly (no LLM dependency).
+FLOOR_PER_SEGMENT_SEQUENCE = int(os.getenv("AL_FLOOR_SEQUENCE", "8"))
+FLOOR_PER_SEGMENT_REASONING = int(os.getenv("AL_FLOOR_REASONING", "6"))
+FLOOR_PER_SEGMENT_INTENT = int(os.getenv("AL_FLOOR_INTENT", "6"))
 
 
 def is_train(trace_id: str) -> bool:
     return int(hashlib.sha256(trace_id.encode()).hexdigest(), 16) % 100 < int(TRAIN_FRACTION * 100)
+
+
+def is_train_trace(trace: AttackTrace) -> bool:
+    """Split on the LINEAGE ROOT, falling back to trace_id for traces with no
+    lineage (benign batches, control family, replay-floor examples).
+
+    Splitting per-trace leaks: run_population_search mutates children from
+    surviving parents with a small jitter, so a parent in train and its
+    near-identical child in test is effectively train-on-test. Hashing the
+    root keeps every descendant of a lineage on the same side."""
+    return is_train(trace.metadata.get("root_id") or trace.trace_id)
 
 
 def _embed_memory(trace: AttackTrace, memory: AttackMemory) -> None:
@@ -92,11 +113,23 @@ def _embed_memory(trace: AttackTrace, memory: AttackMemory) -> None:
 
 
 class LearnableFamily:
-    def __init__(self, family: str, generators: List[RedGenerator], detector: Detector, segment_key):
+    def __init__(
+        self,
+        family: str,
+        generators: List[RedGenerator],
+        detector: Detector,
+        segment_key,
+        segment_universe: List[str],
+        generate_segment_example: Callable[[str], Tuple[Dict[str, Any], AttackTrace, RedGenerator]],
+        floor_per_segment: int,
+    ):
         self.family = family
         self.generators = generators
         self.detector = detector
         self.segment_key = segment_key  # trace -> str, e.g. preset/technique — for the per-segment breakdown
+        self.segment_universe = segment_universe  # the FULL known-segment list, not just what's been observed
+        self.generate_segment_example = generate_segment_example  # segment -> (context, trace, generator)
+        self.floor_per_segment = floor_per_segment
         self.memory_store = AttackMemoryStore()
         self.survivors: Dict[int, List[Dict[str, Any]]] = {}
         self.train_pool: List[AttackTrace] = []
@@ -114,6 +147,103 @@ def _benign_batch(gen: RedGenerator, generation: int, n: int) -> List[AttackTrac
         t.generation = generation
         out.append(t)
     return out
+
+
+def generate_sequence_segment(segment: str) -> Tuple[Dict[str, Any], AttackTrace, RedGenerator]:
+    """SequenceAnomalyGenerator.mutate() already respects a pre-set
+    context["preset"] (only randomizes when the key is absent), so forcing
+    the segment here needs no changes to that file — same pattern already
+    used by evaluation/feature_validation.py's generate_extra_sequence_samples.
+    Zero LLM cost."""
+    gen = SequenceAnomalyGenerator()
+    ctx = dict(gen.seed()[0])
+    ctx["preset"] = segment
+    ctx = gen.mutate(ctx)
+    trace = gen.simulate(ctx, benign=False)
+    return ctx, trace, gen
+
+
+def generate_reasoning_segment(segment: str) -> Tuple[Dict[str, Any], AttackTrace, RedGenerator]:
+    """segment is a sub_attack ("branded_whisper"/"vault_whisper"), matching
+    the granularity segment_key already reports at — dispatches to whichever
+    generator produces it. Their own mutate()'s internal technique choice is
+    left random, matching normal Red behavior."""
+    gen: RedGenerator = BrandedWhisperGenerator() if segment == "branded_whisper" else VaultWhisperGenerator()
+    ctx = dict(gen.seed()[0])
+    ctx = gen.mutate(ctx)
+    trace = gen.simulate(ctx, benign=False) if segment == "branded_whisper" else gen.simulate(ctx)
+    return ctx, trace, gen
+
+
+def generate_intent_segment(segment: str) -> Tuple[Dict[str, Any], AttackTrace, RedGenerator]:
+    """IntentManipulationGenerator.mutate() unconditionally randomizes
+    `technique` (unlike sequence_anomaly's mutate(), it doesn't check
+    context.get("technique") first) — forcing a segment here would require
+    changing that file, which Addendum 3 explicitly rules out. Instead this
+    intentionally re-implements just the technique-forced slice of mutate()
+    (same prompt template, same category/price post-processing, imported
+    from the module rather than copy-pasted) with no evasion-constraint
+    branch, since a floor example isn't reacting to any prior detection —
+    its only job is being a representative, real example of `segment`."""
+    from src.red_team.intent_manipulation import _DECOY_PROMPT, _parse_listing
+    from src.common.llm_client import RED_MODEL, chat
+
+    gen = IntentManipulationGenerator()
+    ctx = dict(gen.seed()[0])
+    prompt = _DECOY_PROMPT.format(
+        technique=segment,
+        raw_user_statement=ctx["raw_user_statement"],
+        category=ctx["category"],
+        brand=ctx["brand"],
+        max_amount=ctx["max_amount"],
+    )
+    rewritten = chat(
+        messages=[{"role": "user", "content": prompt}], model=RED_MODEL, temperature=0.9, max_tokens=400
+    ).strip()
+    title, description = _parse_listing(rewritten, ctx["decoy_title"], ctx["decoy_description"])
+    ctx["technique"] = segment
+    ctx["decoy_title"] = title
+    ctx["decoy_description"] = description
+    ctx["decoy_category"] = ctx["category"]
+    if segment == "category_confusion":
+        ctx["decoy_category"] = "accessories"
+    elif segment == "price_illusion":
+        ctx["decoy_price"] = round(ctx["max_amount"] * 0.98, 2)
+    trace = gen.simulate(ctx, benign=False)
+    return ctx, trace, gen
+
+
+def top_up_replay_floor(fam: LearnableFamily, generation: int) -> List[AttackTrace]:
+    """Addendum 3: independent of Red's adaptive search — guarantees every
+    KNOWN segment has at least `fam.floor_per_segment` examples in
+    train_pool, regardless of what the live population currently favors.
+    Never touches test_pool. Kept in a list SEPARATE from the generation's
+    `new_traces` until the very end (see run_generation) so red_asr/
+    mean_reward/mean_novelty — meant to characterize what Red's adaptive
+    search itself discovered — are structurally unaffected by this
+    scaffolding, not just filtered by convention."""
+    existing_counts = Counter(fam.segment_key(t) for t in fam.train_pool if t.ground_truth_label)
+    topped_up: List[AttackTrace] = []
+    for segment in fam.segment_universe:
+        deficit = fam.floor_per_segment - existing_counts.get(segment, 0)
+        added = 0
+        attempts = 0
+        while added < deficit and attempts < deficit + 3:  # bounded retries if dedup keeps rejecting
+            attempts += 1
+            context, trace, gen = fam.generate_segment_example(segment)
+            trace.generation = generation
+            trace.metadata["source"] = "replay_floor"
+            text = context.get(gen.text_field) if gen.text_field else None
+            params = gen.searchable_params(context)
+            if fam.memory_store.is_duplicate(fam.family, params, text=text):
+                continue
+            verdict = fam.detector.evaluate(trace)
+            novelty = 1.0 - fam.memory_store.max_similarity(fam.family, params, text=text)
+            memory = AttackMemory.from_trace_and_verdict(trace, verdict, generation, params, novelty, reward=0.0)
+            fam.memory_store.record(memory, params, text=text)
+            topped_up.append(trace)
+            added += 1
+    return topped_up
 
 
 def run_generation(
@@ -144,10 +274,24 @@ def run_generation(
     ]
 
     for t in new_traces:
-        (fam.train_pool if is_train(t.trace_id) else fam.test_pool).append(t)
+        (fam.train_pool if is_train_trace(t) else fam.test_pool).append(t)
+
+    # Addendum 3: replay-floor top-up — train_pool only, computed AFTER the
+    # adaptive routing above (so it reacts to this generation's real
+    # shortfall) and kept in its own list until the final write, so it never
+    # touches red_asr/mean_reward/mean_novelty below.
+    floor_traces = top_up_replay_floor(fam, generation)
+    fam.train_pool.extend(floor_traces)
 
     if fam.detector.trainable:
         fam.detector.fit(fam.train_pool)
+        # One-class calibration on the TRAIN pool's attack-free traces only.
+        # Kept strictly separate from fit(): this is what gives the detector
+        # a floor against strategies Red's population has drifted away from
+        # (or never produced), which a label-supervised boundary cannot have.
+        null_train = [t for t in fam.train_pool if not t.ground_truth_label]
+        if null_train:
+            fam.detector.calibrate(null_train)
 
     recovered_case_c = sum(1 for t in case_c_before if fam.detector.evaluate(t).predicted_label)
 
@@ -185,6 +329,7 @@ def run_generation(
         "f1_test": round(cm.f1, 4), "distinct_evasions": distinct_evasions,
         "mean_reward": round(statistics.mean(rewards), 4) if rewards else 0.0,
         "mean_novelty": round(statistics.mean(novelties), 4) if novelties else 0.0,
+        "floor_topups": len(floor_traces),
     })
 
     # Per-segment (preset/technique) recall on the TEST split, cumulative —
@@ -206,7 +351,7 @@ def run_generation(
             "recall": round(n_caught / len(seg_traces), 4) if seg_traces else 0.0,
         })
 
-    write_traces(new_traces, TRACE_PATH, mode="a")
+    write_traces(new_traces + floor_traces, TRACE_PATH, mode="a")
 
 
 def run_control_generation(gen: DelegationAbuseGenerator, det: DelegationAbuseDetector,
@@ -220,7 +365,7 @@ def run_control_generation(gen: DelegationAbuseGenerator, det: DelegationAbuseDe
         new_traces.append(gen.simulate(ctx, benign=False))
     for t in new_traces:
         t.generation = generation
-        (train_pool if is_train(t.trace_id) else test_pool).append(t)
+        (train_pool if is_train_trace(t) else test_pool).append(t)
 
     test_verdicts = [det.evaluate(t) for t in test_pool]
     cm = classification_metrics(test_pool, test_verdicts)
@@ -237,7 +382,7 @@ def run_control_generation(gen: DelegationAbuseGenerator, det: DelegationAbuseDe
         "red_asr": round(red_asr, 4), "blue_recall_test": round(cm.recall, 4),
         "blue_fpr_test": round(cb.false_positive_rate, 4),
         "case_c_test": cb.case_c, "recovered_case_c": 0, "f1_test": round(cm.f1, 4), "distinct_evasions": 0,
-        "mean_reward": "n/a", "mean_novelty": "n/a",
+        "mean_reward": "n/a", "mean_novelty": "n/a", "floor_topups": 0,
     })
     write_traces(new_traces, TRACE_PATH, mode="a")
 
@@ -273,14 +418,23 @@ def main() -> None:
     reasoning_attack = LearnableFamily(
         "reasoning_attack", [BrandedWhisperGenerator(), VaultWhisperGenerator()], ReasoningAttackDetector(),
         segment_key=lambda t: t.sub_attack,
+        segment_universe=["branded_whisper", "vault_whisper"],
+        generate_segment_example=generate_reasoning_segment,
+        floor_per_segment=FLOOR_PER_SEGMENT_REASONING,
     )
     intent_manipulation = LearnableFamily(
         "intent_manipulation", [IntentManipulationGenerator()], IntentManipulationDetector(),
         segment_key=lambda t: t.metadata.get("technique"),
+        segment_universe=list(DECOY_TECHNIQUES),
+        generate_segment_example=generate_intent_segment,
+        floor_per_segment=FLOOR_PER_SEGMENT_INTENT,
     )
     sequence_anomaly = LearnableFamily(
         "sequence_anomaly", [SequenceAnomalyGenerator()], SequenceAnomalyDetector(),
         segment_key=lambda t: t.metadata.get("preset"),
+        segment_universe=list(PRESETS),
+        generate_segment_example=generate_sequence_segment,
+        floor_per_segment=FLOOR_PER_SEGMENT_SEQUENCE,
     )
     learnable = [reasoning_attack, intent_manipulation, sequence_anomaly]
 
@@ -328,8 +482,15 @@ def main() -> None:
             for _ in range(15):
                 ctx = dict(probe_seed)
                 ctx["preset"] = "low_and_slow"
+                # BOTH levers move together. Sweeping amount while pinning
+                # spacing_multiplier at 0.9 (as this did originally) leaves a
+                # constant cadence signal in every sample, so the "weakest"
+                # point is not actually a weak attack and the curve reads
+                # higher than the truth — an earlier version of this sweep
+                # reported 0.60 recall at multiplier 1.00, which was the
+                # detector reading leftover cadence, not amount.
                 ctx["amount_multiplier"] = mult
-                ctx["spacing_multiplier"] = 0.9
+                ctx["spacing_multiplier"] = mult
                 ctx["n_tail_txns"] = 15
                 batch.append(probe_gen.simulate(ctx, benign=False))
             verdicts = [sequence_anomaly.detector.evaluate(t) for t in batch]
