@@ -219,6 +219,8 @@ class AttackTrace(BaseModel):
     evasion_rounds: List[RedScore] = Field(default_factory=list)
     composed_of: List[str] = Field(default_factory=list)
 
+    generation: int = 0  # adaptive co-evolution round this trace was produced in (evaluation/adaptive_loop.py)
+
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
     generated_at: datetime = Field(default_factory=datetime.utcnow)
