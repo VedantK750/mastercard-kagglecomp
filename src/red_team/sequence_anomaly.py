@@ -197,9 +197,17 @@ class SequenceAnomalyGenerator(RedGenerator):
         return txns
 
     def _benign_continuation(self, context: Dict[str, Any], start_time) -> List[Transaction]:
+        # Configurable so Blue can be given LENGTH-MATCHED benign traces.
+        # Default 6 keeps every existing reproduction script byte-identical.
+        # This matters: with a fixed 6, every benign trace is 14 transactions
+        # while low_and_slow is 23, so an attack-free 23-txn sequence is
+        # out-of-distribution for a detector trained only on short benign
+        # examples — measured at a 25% false-positive rate on pure nulls that
+        # differ from benign ONLY in length. Trace length is not evidence of
+        # fraud, and a detector must not be allowed to learn that it is.
         txns = []
         t = start_time
-        for _ in range(6):
+        for _ in range(int(context.get("n_benign_continuation", 6))):
             amount = round(_clip_positive(random.gauss(context["avg_amount"], context["std_amount"] * 0.4)), 2)
             txns.append(
                 Transaction(

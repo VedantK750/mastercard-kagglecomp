@@ -112,3 +112,52 @@ class AttackMemoryStore:
 
     def all_entries(self) -> List[AttackMemory]:
         return list(self._entries)
+
+
+class BlueReplayMemory:
+    """Training-coverage bookkeeping for Blue — deliberately NOT the same
+    store as `AttackMemoryStore` above.
+
+    The two have OPPOSITE objectives, and conflating them caused a real bug:
+    the first stratified-replay-floor implementation checked candidates
+    against Red's `AttackMemoryStore` before accepting them, so near-
+    duplicates were rejected. But Red's store exists to SUPPRESS similarity
+    (that's what makes its novelty score and distinct-evasion count
+    meaningful), while Blue's training wants the opposite — mass and coverage,
+    where near-duplicates are harmless and often useful. The result was a
+    floor that filled 1 of 8 requested slots for `low_and_slow` and left the
+    generalization numbers uninterpretable.
+
+    So: Red dedups, Blue accumulates. This class tracks per-segment counts so
+    a floor can be topped up to a target, and tags hard negatives (traces Red
+    got past Blue) so their contribution stays auditable. It intentionally
+    holds no similarity logic at all."""
+
+    def __init__(self) -> None:
+        self._by_segment: Dict[str, List[str]] = {}
+        self._hard_negatives: set[str] = set()
+
+    def record(self, segment: Optional[str], trace_id: str, is_hard_negative: bool = False) -> None:
+        self._by_segment.setdefault(segment or "unknown", []).append(trace_id)
+        if is_hard_negative:
+            self._hard_negatives.add(trace_id)
+
+    def count(self, segment: str) -> int:
+        return len(self._by_segment.get(segment, []))
+
+    def deficit(self, segment: str, target: int) -> int:
+        return max(0, target - self.count(segment))
+
+    def coverage(self, segment_universe: List[str], target: int) -> Dict[str, int]:
+        """Per-segment shortfall against the floor — what top-up must close."""
+        return {seg: self.deficit(seg, target) for seg in segment_universe}
+
+    def mark_hard_negative(self, trace_id: str) -> None:
+        self._hard_negatives.add(trace_id)
+
+    def is_hard_negative(self, trace_id: str) -> bool:
+        return trace_id in self._hard_negatives
+
+    @property
+    def n_hard_negatives(self) -> int:
+        return len(self._hard_negatives)

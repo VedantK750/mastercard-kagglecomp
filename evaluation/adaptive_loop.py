@@ -46,7 +46,7 @@ from src.blue_team.intent_manipulation_detector import IntentManipulationDetecto
 from src.blue_team.reasoning_attack_detector import ReasoningAttackDetector
 from src.blue_team.sequence_anomaly_detector import SequenceAnomalyDetector
 from src.common.feedback import AttackMemory
-from src.common.memory import AttackMemoryStore
+from src.common.memory import AttackMemoryStore, BlueReplayMemory
 from src.common.schemas import AttackTrace
 from src.common.scoring import attack_succeeded
 from src.common.trace_io import write_traces
@@ -77,6 +77,7 @@ CSV_FIELDS = [
     "generation", "family", "n_train_pool", "n_test_pool", "red_asr",
     "blue_recall_test", "blue_fpr_test", "case_c_test", "recovered_case_c", "f1_test",
     "distinct_evasions", "mean_reward", "mean_novelty", "floor_topups",
+    "hard_negatives_total", "hard_negatives_in_train",
 ]
 
 # Addendum 3 — stratified replay floor (see plan file). Independent of Red's
@@ -130,18 +131,30 @@ class LearnableFamily:
         self.segment_universe = segment_universe  # the FULL known-segment list, not just what's been observed
         self.generate_segment_example = generate_segment_example  # segment -> (context, trace, generator)
         self.floor_per_segment = floor_per_segment
-        self.memory_store = AttackMemoryStore()
+        self.memory_store = AttackMemoryStore()   # RED: novelty / dedup / distinct evasions
+        self.replay_memory = BlueReplayMemory()   # BLUE: training coverage / hard negatives
         self.survivors: Dict[int, List[Dict[str, Any]]] = {}
         self.train_pool: List[AttackTrace] = []
         self.test_pool: List[AttackTrace] = []
 
 
 def _benign_batch(gen: RedGenerator, generation: int, n: int) -> List[AttackTrace]:
+    """Benign traces for FPR tracking. For sequence_anomaly, half the batch is
+    LENGTH-MATCHED to the attack traces (a longer benign continuation).
+
+    Without this, every benign example is 14 transactions while low_and_slow
+    is 23, so an attack-free 23-txn sequence is out-of-distribution for Blue
+    — measured 25% false positives on pure nulls differing from benign ONLY
+    in length. That inflates apparent recall and understates FPR, because
+    trace length becomes a usable proxy for the label. It is not one."""
     seed_ctx = gen.seed()[0]
     out = []
-    for _ in range(n):
+    for i in range(n):
+        ctx = dict(seed_ctx)
+        if getattr(gen, "family", None) == "sequence_anomaly" and i % 2 == 1:
+            ctx["n_benign_continuation"] = 15  # matches low_and_slow's tail length
         try:
-            t = gen.simulate(dict(seed_ctx), benign=True)
+            t = gen.simulate(ctx, benign=True)
         except TypeError:
             return []  # this generator's simulate() has no benign kwarg (VaultWhisperGenerator)
         t.generation = generation
@@ -149,16 +162,39 @@ def _benign_batch(gen: RedGenerator, generation: int, n: int) -> List[AttackTrac
     return out
 
 
+# Explicit parameter GRID for replay-floor generation, walked round-robin.
+# NOT one-step jitter: the original floor mutated once off a fixed preset
+# default, and `0.85 * uniform(0.95,1.05)` spans 0.8075-0.8925, which the
+# memory store's 1-decimal quantization collapsed into ~2 distinct buckets.
+# Every later attempt then looked like a near-duplicate and was rejected, so
+# the floor filled 1 of 8 requested low_and_slow slots. A grid guarantees
+# real, reproducible spread across the strength axis Red actually searches.
+_FLOOR_GRID = [
+    (0.80, 0.80, 12), (0.85, 0.85, 15), (0.90, 0.90, 18),
+    (0.92, 0.92, 15), (0.95, 0.95, 20), (0.97, 0.97, 12),
+    (1.05, 1.05, 15), (1.15, 1.15, 12),  # upward variants — attacks aren't only drains
+]
+_floor_grid_cursor = {"i": 0}
+
+
 def generate_sequence_segment(segment: str) -> Tuple[Dict[str, Any], AttackTrace, RedGenerator]:
-    """SequenceAnomalyGenerator.mutate() already respects a pre-set
-    context["preset"] (only randomizes when the key is absent), so forcing
-    the segment here needs no changes to that file — same pattern already
-    used by evaluation/feature_validation.py's generate_extra_sequence_samples.
-    Zero LLM cost."""
+    """Zero LLM cost. Walks _FLOOR_GRID round-robin so successive calls for
+    the same segment land on genuinely different parameter regions instead of
+    re-drawing the same quantized bucket."""
     gen = SequenceAnomalyGenerator()
     ctx = dict(gen.seed()[0])
     ctx["preset"] = segment
-    ctx = gen.mutate(ctx)
+    amt, spacing, n_tail = _FLOOR_GRID[_floor_grid_cursor["i"] % len(_FLOOR_GRID)]
+    _floor_grid_cursor["i"] += 1
+    if segment == "low_and_slow":
+        # Only this preset is defined by a subtle multiplier; the other two
+        # have their own structural signatures (burst / category drift) that
+        # these multipliers would distort rather than diversify.
+        ctx["amount_multiplier"] = amt
+        ctx["spacing_multiplier"] = spacing
+        ctx["n_tail_txns"] = n_tail
+    else:
+        ctx = gen.mutate(ctx)
     trace = gen.simulate(ctx, benign=False)
     return ctx, trace, gen
 
@@ -226,23 +262,21 @@ def top_up_replay_floor(fam: LearnableFamily, generation: int) -> List[AttackTra
     topped_up: List[AttackTrace] = []
     for segment in fam.segment_universe:
         deficit = fam.floor_per_segment - existing_counts.get(segment, 0)
-        added = 0
-        attempts = 0
-        while added < deficit and attempts < deficit + 3:  # bounded retries if dedup keeps rejecting
-            attempts += 1
-            context, trace, gen = fam.generate_segment_example(segment)
+        for _ in range(max(0, deficit)):
+            _context, trace, _gen = fam.generate_segment_example(segment)
             trace.generation = generation
             trace.metadata["source"] = "replay_floor"
-            text = context.get(gen.text_field) if gen.text_field else None
-            params = gen.searchable_params(context)
-            if fam.memory_store.is_duplicate(fam.family, params, text=text):
-                continue
-            verdict = fam.detector.evaluate(trace)
-            novelty = 1.0 - fam.memory_store.max_similarity(fam.family, params, text=text)
-            memory = AttackMemory.from_trace_and_verdict(trace, verdict, generation, params, novelty, reward=0.0)
-            fam.memory_store.record(memory, params, text=text)
+            # NO dedup check, and nothing recorded into fam.memory_store.
+            # That store is RED's discovery memory: its whole job is to
+            # suppress similarity so novelty and distinct-evasion counts mean
+            # something. Blue's training wants the opposite — coverage and
+            # mass, where near-duplicates are harmless. Routing floor traces
+            # through Red's dedup is exactly what broke the first version
+            # (1 of 8 low_and_slow slots filled). Floor traces are already
+            # excluded from red_asr/mean_reward/mean_novelty/distinct_evasions,
+            # so they cannot inflate any Red-side metric by being here.
+            fam.replay_memory.record(segment, trace.trace_id)
             topped_up.append(trace)
-            added += 1
     return topped_up
 
 
@@ -272,6 +306,21 @@ def run_generation(
         t for t in new_traces
         if t.ground_truth_label and attack_succeeded(t) and not pre_fit_verdicts[t.trace_id].predicted_label
     ]
+    # Item 6 — hard-negative curriculum. A Case-C trace (attack SUCCEEDED and
+    # Blue MISSED it) is precisely the example Blue most needs to learn from:
+    # Red found a live blind spot. Tag them so their contribution is
+    # auditable, then let the normal lineage split route them.
+    #
+    # Integrity constraint: a hard negative is a TRAINING signal supporting an
+    # in-distribution adaptive claim ("Blue closes blind spots Red discovers"),
+    # never a generalization claim. It must never be force-fed into the train
+    # pool against its lineage assignment — doing so would put a near-twin of
+    # a test trace into training. The split below is left untouched on
+    # purpose; `recovered_case_c` then measures whether Blue actually closed
+    # the ones it was allowed to see.
+    for t in case_c_before:
+        t.metadata["hard_negative"] = True
+        fam.replay_memory.mark_hard_negative(t.trace_id)
 
     for t in new_traces:
         (fam.train_pool if is_train_trace(t) else fam.test_pool).append(t)
@@ -330,6 +379,13 @@ def run_generation(
         "mean_reward": round(statistics.mean(rewards), 4) if rewards else 0.0,
         "mean_novelty": round(statistics.mean(novelties), 4) if novelties else 0.0,
         "floor_topups": len(floor_traces),
+        "hard_negatives_total": fam.replay_memory.n_hard_negatives,
+        # How many of Red's discovered blind spots Blue was actually ALLOWED
+        # to train on. The gap between these two columns is the lineage
+        # split doing its job, not data being lost.
+        "hard_negatives_in_train": sum(
+            1 for t in fam.train_pool if t.metadata.get("hard_negative")
+        ),
     })
 
     # Per-segment (preset/technique) recall on the TEST split, cumulative —
@@ -383,6 +439,7 @@ def run_control_generation(gen: DelegationAbuseGenerator, det: DelegationAbuseDe
         "blue_fpr_test": round(cb.false_positive_rate, 4),
         "case_c_test": cb.case_c, "recovered_case_c": 0, "f1_test": round(cm.f1, 4), "distinct_evasions": 0,
         "mean_reward": "n/a", "mean_novelty": "n/a", "floor_topups": 0,
+        "hard_negatives_total": 0, "hard_negatives_in_train": 0,
     })
     write_traces(new_traces, TRACE_PATH, mode="a")
 
@@ -405,6 +462,16 @@ def run_generalization_check(fam: LearnableFamily, held_in, held_out, key: str) 
     fresh.fit(train)
     if getattr(fresh, "_clf", None) is None:
         return (0, 0)  # degenerate fit — not a fair generalization check
+    # Calibrate the one-class layer too, so this check measures the ARCHITECTURE
+    # actually deployed rather than the supervised half alone. Legitimate here:
+    # calibration sees only attack-free traces, never the held-out strategy, so
+    # it cannot leak the thing being tested. This matters because the supervised
+    # half is expected to score ~0 on a strategy absent from its training pool
+    # (its deciding coefficient is unidentified there) — reporting only that
+    # would understate the deployed detector.
+    null_train = [t for t in train if not t.ground_truth_label]
+    if null_train:
+        fresh.calibrate(null_train)
     caught = sum(1 for t in test if fresh.evaluate(t).predicted_label)
     return (len(test), caught)
 
@@ -494,8 +561,14 @@ def main() -> None:
                 ctx["n_tail_txns"] = 15
                 batch.append(probe_gen.simulate(ctx, benign=False))
             verdicts = [sequence_anomaly.detector.evaluate(t) for t in batch]
-            recall = sum(1 for v in verdicts if v.predicted_label) / len(verdicts)
-            print(f"  amount_multiplier={mult:.2f}: recall={recall:.2f} (n={len(verdicts)})")
+            rate = sum(1 for v in verdicts if v.predicted_label) / len(verdicts)
+            # At multiplier 1.00 BOTH levers are neutral, so this batch is a
+            # pure NULL — statistically identical to benign, differing only in
+            # tail length. Its flag rate is a FALSE-POSITIVE rate, not recall,
+            # and labelling it "recall" would read as detection of an attack
+            # that isn't there.
+            label = "FPR (null control)" if mult >= 1.0 else "recall"
+            print(f"  amount_multiplier={mult:.2f}: {label}={rate:.2f} (n={len(verdicts)})")
     else:
         print("  sequence_anomaly detector never successfully fit this run — skipping robustness sweep")
     print(
