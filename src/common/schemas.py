@@ -9,6 +9,7 @@ a family's shape.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
@@ -126,6 +127,31 @@ class CredentialState(str, Enum):
 # Red scoring
 # ---------------------------------------------------------------------------
 
+def normalize_payment_impact(raw_impact: float) -> float:
+    """Saturating transform applied to every family's raw payment impact.
+
+    G2 fix. The raw ratio (tail value / baseline value) grows LINEARLY with
+    transaction count, which made "emit more transactions" strictly better
+    than "be stealthier". Measured directly: raw impact 1.86 / 3.92 / 6.76 for
+    tails of 15 / 30 / 55, while per-transaction impact stayed flat at ~0.12.
+    A CEM optimizer handed that search space converged on 55 transactions at
+    normal amounts — maximal reward, no attack.
+
+    log1p is used rather than a hard clamp because it keeps the ordering
+    intact (more extracted value still scores higher, so genuine high-impact
+    fraud is still preferred over low-impact fraud) while making each
+    additional transaction worth progressively less. It is also very nearly
+    the identity for the small impacts the LLM families produce (a 0.056
+    price-difference ratio maps to 0.054), so this changes their behavior
+    negligibly while closing the exploit where it actually existed.
+
+    Count pressure is constrained from two directions after this change:
+    diminishing returns here, and an explicit volume-plausibility penalty in
+    src/common/realism.py.
+    """
+    return math.log1p(max(0.0, raw_impact))
+
+
 class RedScore(BaseModel):
     intent_deviation: float = 0.0
     payment_impact: float = 0.0
@@ -141,11 +167,18 @@ class RedScore(BaseModel):
         realism: float,
         novelty: float,
         detection_probability: float,
+        normalize_impact: bool = True,
     ) -> "RedScore":
-        r_red = intent_deviation * payment_impact * realism * novelty - detection_probability
+        """`payment_impact` is passed in RAW and normalized here, so every
+        family gets the same treatment and no generator can opt out by
+        forgetting to call the transform. The stored field is the normalized
+        value — that is what the reward used, so it is what should be
+        reported."""
+        impact = normalize_payment_impact(payment_impact) if normalize_impact else payment_impact
+        r_red = intent_deviation * impact * realism * novelty - detection_probability
         return RedScore(
             intent_deviation=intent_deviation,
-            payment_impact=payment_impact,
+            payment_impact=impact,
             realism=realism,
             novelty=novelty,
             detection_probability=detection_probability,

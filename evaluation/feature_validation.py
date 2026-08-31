@@ -261,6 +261,7 @@ def generate_extra_sequence_samples(n_each: int = 16) -> List[AttackTrace]:
         for _ in range(n_each):
             ctx = dict(base_seed)
             ctx["preset"] = preset
+            ctx["_lock_preset"] = True   # controlled experiment: keep requested preset
             ctx["avg_amount"] = base_seed["avg_amount"] * random.uniform(0.85, 1.15)
             ctx["velocity_hours"] = base_seed["velocity_hours"] * random.uniform(0.85, 1.15)
             ctx = gen.mutate(ctx)

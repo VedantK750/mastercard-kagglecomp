@@ -92,6 +92,7 @@ def make(
             t = GEN.simulate(ctx, benign=True)
         else:
             ctx["preset"] = preset
+            ctx["_lock_preset"] = True   # controlled experiment: strategy is the IV, never resampled
             if amount_multiplier is not None:
                 ctx["amount_multiplier"] = amount_multiplier
                 ctx["spacing_multiplier"] = spacing_multiplier

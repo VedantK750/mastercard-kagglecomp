@@ -147,10 +147,13 @@ def _benign_batch(gen: RedGenerator, generation: int, n: int) -> List[AttackTrac
     — measured 25% false positives on pure nulls differing from benign ONLY
     in length. That inflates apparent recall and understates FPR, because
     trace length becomes a usable proxy for the label. It is not one."""
-    seed_ctx = gen.seed()[0]
+    seeds = gen.seed()
     out = []
     for i in range(n):
-        ctx = dict(seed_ctx)
+        # G4: rotate scenarios so benign traces span profiles too. A benign
+        # set drawn from ONE profile makes Blue's "normal" far narrower than
+        # reality, which inflates apparent separation from attacks.
+        ctx = dict(seeds[i % len(seeds)])
         if getattr(gen, "family", None) == "sequence_anomaly" and i % 2 == 1:
             ctx["n_benign_continuation"] = 15  # matches low_and_slow's tail length
         try:
@@ -182,7 +185,8 @@ def generate_sequence_segment(segment: str) -> Tuple[Dict[str, Any], AttackTrace
     the same segment land on genuinely different parameter regions instead of
     re-drawing the same quantized bucket."""
     gen = SequenceAnomalyGenerator()
-    ctx = dict(gen.seed()[0])
+    seeds = gen.seed()
+    ctx = dict(seeds[_floor_grid_cursor["i"] % len(seeds)])  # G4: vary scenario too
     ctx["preset"] = segment
     amt, spacing, n_tail = _FLOOR_GRID[_floor_grid_cursor["i"] % len(_FLOOR_GRID)]
     _floor_grid_cursor["i"] += 1
@@ -205,7 +209,8 @@ def generate_reasoning_segment(segment: str) -> Tuple[Dict[str, Any], AttackTrac
     generator produces it. Their own mutate()'s internal technique choice is
     left random, matching normal Red behavior."""
     gen: RedGenerator = BrandedWhisperGenerator() if segment == "branded_whisper" else VaultWhisperGenerator()
-    ctx = dict(gen.seed()[0])
+    seeds = gen.seed()
+    ctx = dict(seeds[_floor_grid_cursor["i"] % len(seeds)])  # G4
     ctx = gen.mutate(ctx)
     trace = gen.simulate(ctx, benign=False) if segment == "branded_whisper" else gen.simulate(ctx)
     return ctx, trace, gen
@@ -225,7 +230,8 @@ def generate_intent_segment(segment: str) -> Tuple[Dict[str, Any], AttackTrace, 
     from src.common.llm_client import RED_MODEL, chat
 
     gen = IntentManipulationGenerator()
-    ctx = dict(gen.seed()[0])
+    seeds = gen.seed()
+    ctx = dict(seeds[_floor_grid_cursor["i"] % len(seeds)])  # G4
     prompt = _DECOY_PROMPT.format(
         technique=segment,
         raw_user_statement=ctx["raw_user_statement"],
@@ -287,7 +293,12 @@ def run_generation(
     memory_by_id: Dict[str, AttackMemory] = {}
 
     for gen_obj in fam.generators:
-        seed_ctx = gen_obj.seed()[0]
+        # G4: rotate the starting scenario by generation so a multi-generation
+        # run covers several profiles instead of re-running one. Survivors are
+        # still carried forward, so lineages that already exist keep evolving —
+        # this only changes where NEW lineages start.
+        all_seeds = gen_obj.seed()
+        seed_ctx = all_seeds[(generation - 1) % len(all_seeds)]
         prior = fam.survivors.get(id(gen_obj))
         gres = run_population_search(
             gen_obj, fam.detector, fam.memory_store, seed_ctx, generation,
@@ -413,8 +424,9 @@ def run_generation(
 def run_control_generation(gen: DelegationAbuseGenerator, det: DelegationAbuseDetector,
                             generation: int, train_pool: List[AttackTrace], test_pool: List[AttackTrace],
                             csv_rows: List[Dict[str, Any]]) -> None:
-    seed_ctx = gen.seed()[0]
-    new_traces = [gen.simulate(seed_ctx, benign=True) for _ in range(3)]
+    seeds = gen.seed()
+    seed_ctx = seeds[(generation - 1) % len(seeds)]  # G4
+    new_traces = [gen.simulate(dict(seeds[i % len(seeds)]), benign=True) for i in range(3)]
     for violation_type in VIOLATION_TYPES:
         ctx = dict(seed_ctx)
         ctx["violation_type"] = violation_type

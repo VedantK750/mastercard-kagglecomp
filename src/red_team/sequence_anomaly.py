@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional
 
 from src.common.ap2_env import new_trace_id, new_txn_id, now
 from src.common.feedback import AttackMemory
+from src.common.realism import sequence_realism
 from src.common.schemas import AttackTrace, CredentialState, IntentObject, RedScore, Transaction
 from src.red_team.base import RedGenerator
 
@@ -55,6 +56,35 @@ _PRESET_DETECTION_PRIOR = {  # Red's own prior guess at how loud each preset is
     "sequence_shift": 0.5,
     "low_and_slow": 0.15,
 }
+
+# G3 — a real, explicit, testable success criterion. Previously
+# `attack_succeeded = preset is not None`, i.e. True whenever an attack
+# existed, which made ASR 1.0 by construction and left Case C carrying no
+# information for this family. Success now means the trajectory actually
+# extracted meaningful value: at least this many "normal transactions worth"
+# of spend in the attack tail. A 4-transaction low-and-slow at 0.85x the
+# usual amount does NOT clear this bar, and should not — barely touching an
+# account is an attempt, not a successful fraud.
+FRAUD_SUCCESS_TXN_EQUIVALENTS = 5.0
+
+# G7 — the searchable parameter space, with bounds. These are the dimensions
+# that actually change the SHAPE of a trajectory rather than nudging it.
+# Bounds are deliberately conservative: n_tail_txns is capped well below the
+# point where the volume-plausibility term in realism.py would dominate, so
+# Red explores real trajectory shapes instead of rediscovering the
+# transaction-count exploit that G1/G2 just closed.
+_PARAM_BOUNDS: Dict[str, tuple] = {
+    "amount_multiplier": (0.5, 8.0),
+    "spacing_multiplier": (0.3, 3.0),
+    "n_tail_txns": (3, 16),
+    "drift_steps": (0, 4),
+}
+
+# G5 — probability that a mutation crosses to a different preset. Small on
+# purpose: most children stay related to their parent (preserving the lineage
+# semantics the reward and the train/test split depend on), but a lineage is
+# no longer permanently trapped in whichever preset it started with.
+PRESET_SWITCH_PROB = 0.15
 _PRESET_NOVELTY = {  # static fallback only — evasion.py's population search uses measured novelty instead
     "credential_ato": 0.4,   # well-known pattern
     "sequence_shift": 0.7,
@@ -80,21 +110,74 @@ class SequenceAnomalyGenerator(RedGenerator):
     sub_attack = None  # preset lives in metadata; no SubAttackLiteral entry needed (not injection-based)
 
     def seed(self) -> List[Dict[str, Any]]:
+        """G4 — seven distinct spending PROFILES, not one profile with cosmetic
+        variations. They differ on the dimensions that actually change what a
+        detector sees: typical amount (12 -> 480), dispersion (tight vs. wide),
+        cadence (6h -> 168h between transactions), and history length (6 -> 14
+        baseline transactions).
+
+        This matters because every result before this change was effectively
+        n=1 in scenario space: we measured variance across mutations of one
+        grocery shopper, never across situations. A low-and-slow drain against
+        a high-variance luxury spender is a materially different detection
+        problem from the same attack against a tight, regular grocery
+        account, and only the second was ever being tested.
+
+        `scenario_id` is carried into trace metadata so scenario coverage is
+        reportable and the train/test split can be audited against it."""
         return [
             {
-                "session_user_id": "user_carol",
-                "agent_id": "shopping_agent_1",
+                "scenario_id": "grocery_regular",
+                "session_user_id": "user_carol", "agent_id": "shopping_agent_1",
                 "typical_category": "groceries",
-                "avg_amount": 45.0,
-                "std_amount": 15.0,
-                "velocity_hours": 20.0,  # ~1 transaction per 20 hours at baseline
-                "n_baseline": 8,
-            }
+                "avg_amount": 45.0, "std_amount": 15.0, "velocity_hours": 20.0, "n_baseline": 8,
+            },
+            {
+                "scenario_id": "daily_coffee",
+                "session_user_id": "user_dan", "agent_id": "shopping_agent_1",
+                "typical_category": "dining",
+                "avg_amount": 12.0, "std_amount": 3.0, "velocity_hours": 8.0, "n_baseline": 14,
+            },
+            {
+                "scenario_id": "commuter_transit",
+                "session_user_id": "user_erin", "agent_id": "shopping_agent_1",
+                "typical_category": "transport",
+                "avg_amount": 28.0, "std_amount": 6.0, "velocity_hours": 12.0, "n_baseline": 12,
+            },
+            {
+                "scenario_id": "household_bulk",
+                "session_user_id": "user_frank", "agent_id": "shopping_agent_1",
+                "typical_category": "household",
+                "avg_amount": 130.0, "std_amount": 55.0, "velocity_hours": 72.0, "n_baseline": 8,
+            },
+            {
+                "scenario_id": "electronics_occasional",
+                "session_user_id": "user_grace", "agent_id": "shopping_agent_1",
+                "typical_category": "electronics",
+                "avg_amount": 310.0, "std_amount": 120.0, "velocity_hours": 168.0, "n_baseline": 6,
+            },
+            {
+                "scenario_id": "luxury_highvariance",
+                "session_user_id": "user_henry", "agent_id": "shopping_agent_1",
+                "typical_category": "luxury_goods",
+                "avg_amount": 480.0, "std_amount": 260.0, "velocity_hours": 120.0, "n_baseline": 7,
+            },
+            {
+                "scenario_id": "smallbiz_supplies",
+                "session_user_id": "user_iris", "agent_id": "shopping_agent_1",
+                "typical_category": "office_supplies",
+                "avg_amount": 95.0, "std_amount": 30.0, "velocity_hours": 6.0, "n_baseline": 14,
+            },
         ]
 
     def searchable_params(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        # scenario_id is included so two structurally-identical attacks against
+        # DIFFERENT spending profiles are not treated as duplicates — post-G4
+        # they are genuinely different attacks, and collapsing them would make
+        # the novelty signal (and the dedup) wrong.
         return {
             "preset": context.get("preset"),
+            "scenario_id": context.get("scenario_id"),
             "amount_multiplier": context.get("amount_multiplier"),
             "spacing_multiplier": context.get("spacing_multiplier"),
             "n_tail_txns": context.get("n_tail_txns"),
@@ -103,7 +186,47 @@ class SequenceAnomalyGenerator(RedGenerator):
 
     def mutate(self, seed_context: Dict[str, Any], feedback: Optional[Any] = None) -> Dict[str, Any]:
         context = dict(seed_context)
-        preset = context.get("preset") or random.choice(PRESETS)
+        prior_preset = context.get("preset")
+
+        # G5 — break the one-way door. Previously `context.get("preset") or
+        # random.choice(PRESETS)` only randomized off a BARE seed, so once a
+        # lineage carried a preset every descendant inherited it forever and
+        # Red could never explore across strategies. A lineage that converged
+        # on low_and_slow was permanently unable to try credential_ato, which
+        # is what starved Blue's training pool of the other presets.
+        #
+        # Resampling is deliberately a minority event: most children stay
+        # related to their parent (the reward, the survivor selection, and the
+        # lineage-based train/test split all depend on that), but the door now
+        # opens both ways.
+        # `_lock_preset` pins the strategy for CONTROLLED experiments. Without
+        # it, a batch requested as "credential_ato" silently acquires some
+        # low_and_slow members via the switching below — which is correct and
+        # desirable during adaptive search, but is a leak in a cross-strategy
+        # generalization test where the held-out strategy must appear NOWHERE
+        # in training. evaluation/generalization_suite.py's TIER 3 assertion
+        # caught exactly this, and the lock is the fix rather than weakening
+        # the assertion.
+        locked = bool(context.get("_lock_preset"))
+        switched = False
+        if prior_preset is None:
+            preset = random.choice(PRESETS)
+        elif locked:
+            preset = prior_preset
+        elif random.random() < PRESET_SWITCH_PROB:
+            alternatives = [p for p in PRESETS if p != prior_preset]
+            preset = random.choice(alternatives)
+            switched = True
+        else:
+            preset = prior_preset
+
+        if switched:
+            # Carry no stale levers across a strategy boundary — a
+            # credential_ato amount_multiplier of 7.0 is meaningless for
+            # low_and_slow and would land the child far outside the new
+            # preset's plausible region.
+            for key in _PRESET_DEFAULTS[prior_preset]:
+                context.pop(key, None)
         for key, value in _PRESET_DEFAULTS[preset].items():
             context.setdefault(key, value)
 
@@ -115,6 +238,18 @@ class SequenceAnomalyGenerator(RedGenerator):
         context["amount_multiplier"] = context["amount_multiplier"] * random.uniform(0.95, 1.05)
         context["spacing_multiplier"] = context["spacing_multiplier"] * random.uniform(0.95, 1.05)
 
+        # G7 — the structural levers are now genuinely searched, not just
+        # declared. n_tail_txns changes trajectory SHAPE (a 4-transaction
+        # smash-and-grab vs. a 16-transaction drain are qualitatively
+        # different attacks, not numeric variants of one), and drift_steps
+        # controls how far sequence_shift's category walk actually travels.
+        # Both were previously fixed at their preset default for the entire
+        # life of a run.
+        if random.random() < 0.5:
+            context["n_tail_txns"] = int(context.get("n_tail_txns", 6)) + random.choice((-2, -1, 1, 2))
+        if preset == "sequence_shift" and random.random() < 0.5:
+            context["drift_steps"] = int(context.get("drift_steps", 4)) + random.choice((-1, 1))
+
         if isinstance(feedback, AttackMemory) and feedback.blue_detected:
             for reason in feedback.detection_reasons:
                 if reason == "velocity_ratio":
@@ -123,8 +258,21 @@ class SequenceAnomalyGenerator(RedGenerator):
                     context["amount_multiplier"] = 1 + (context["amount_multiplier"] - 1) * 0.8
                 elif reason == "category_drift":
                     context["drift_steps"] = max(0, int(context.get("drift_steps", 0)) - 1)
+                elif reason in ("cusum_norm", "persistence_frac"):
+                    # Sustained-deviation reasons: shorten the tail so there
+                    # is less for an accumulating statistic to accumulate.
+                    context["n_tail_txns"] = int(context.get("n_tail_txns", 6)) - 1
+
+        # Clamp every searched lever into its bounds. This is what stops the
+        # search walking off into the reward-exploitation region G1/G2 closed
+        # — bounds are enforced here rather than trusted to the reward alone.
+        for key, (lo, hi) in _PARAM_BOUNDS.items():
+            if key in context and context[key] is not None:
+                value = max(lo, min(hi, context[key]))
+                context[key] = int(round(value)) if isinstance(lo, int) else value
 
         context["preset"] = preset
+        context["preset_switched"] = switched
         return context
 
     def _baseline_txns(self, context: Dict[str, Any]) -> List[Transaction]:
@@ -247,12 +395,26 @@ class SequenceAnomalyGenerator(RedGenerator):
 
         baseline_total = sum(t.amount for t in baseline)
         tail_total = sum(t.amount for t in tail)
-        attack_succeeded = preset is not None  # nothing in this env blocks the tail from executing
+
+        # G3 — real success criterion. Was `preset is not None` (True whenever
+        # an attack existed), which pinned ASR at 1.0 and made Case C
+        # uninformative for this family. Success now requires the trajectory
+        # to have actually extracted meaningful value, measured in
+        # "normal transactions worth" of this specific account's spend, so the
+        # bar scales with the profile rather than being an absolute figure
+        # that means different things to a coffee buyer and a luxury spender.
+        #
+        # Explicitly NOT a function of whether Blue caught it — attack_present,
+        # attack_succeeded, and blue_detected stay independent.
+        txn_equivalents = tail_total / max(context["avg_amount"], 1e-9)
+        attack_succeeded = bool(preset is not None and txn_equivalents >= FRAUD_SUCCESS_TXN_EQUIVALENTS)
+
+        realism = sequence_realism(baseline, tail, baseline_mean_amount=context["avg_amount"]) if preset else 1.0
 
         red_score = RedScore.compute(
             intent_deviation=1.0 if preset else 0.0,
             payment_impact=(tail_total / max(baseline_total, 1.0)) if preset else 0.0,
-            realism=0.85,
+            realism=realism,
             novelty=_PRESET_NOVELTY.get(preset, 0.0),
             detection_probability=_PRESET_DETECTION_PRIOR.get(preset, 0.05),
         )
@@ -280,8 +442,14 @@ class SequenceAnomalyGenerator(RedGenerator):
             red_score=red_score,
             metadata={
                 "preset": preset,
+                "scenario_id": context.get("scenario_id"),          # G4 scenario coverage
+                "preset_switched": context.get("preset_switched", False),  # G5 transitions
                 "credential_state": credential_state.value,
                 "attack_succeeded": attack_succeeded,
+                "txn_equivalents_extracted": round(txn_equivalents, 2),  # G3 — why success/failure
+                "realism": realism,                                  # G1 — measured, not constant
+                "n_tail_txns": len(tail),                            # G7 — searched, so recorded
+                "drift_steps": context.get("drift_steps"),
                 "baseline_total": round(baseline_total, 2),
                 "tail_total": round(tail_total, 2),
             },

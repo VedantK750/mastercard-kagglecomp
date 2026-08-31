@@ -22,7 +22,7 @@ import hashlib
 import json
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .llm_client import VICTIM_MODEL, chat
 from .schemas import IntentObject, Mandate, Product, Transaction
@@ -83,18 +83,57 @@ class MerchantAgent:
 # Credentials Provider Agent — the Vault Whisper target
 # ---------------------------------------------------------------------------
 
-class CredentialsProviderAgent:
-    def __init__(self, credential_store: Dict[str, Dict[str, Any]]) -> None:
-        self.credential_store = credential_store
+class BlockedExecution(Exception):
+    """Raised when a pre-execution guard refuses an action. Carries the
+    reason so the trace can record WHY, not just that it happened."""
 
-    def fulfill_request(self, requested_user_id: str) -> Optional[Dict[str, Any]]:
-        """Returns whatever credential record is asked for, with NO
-        independent re-verification that the caller (ShoppingAgent, acting
-        on the current session's behalf) is actually authorized to see this
-        specific user's data. This is the undefended baseline that
-        reproduces the paper's Vault Whisper result — the identity check
-        that should happen here is exactly what PCAT's P2 principle and
-        Blue's reasoning-attack detector are meant to add back."""
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class CredentialsProviderAgent:
+    """G6 — optionally gated by a pre-execution guard.
+
+    `guard` is a callable `(session_user_id, requested_user_id) -> Optional[str]`
+    returning a refusal reason, or None to allow. It runs BEFORE the record is
+    released, which is the whole point: `identity_mismatch` is computable at
+    that moment, so the check that Blue previously performed post-hoc on a
+    completed trace can instead prevent the disclosure.
+
+    Default is None — the undefended baseline. That is deliberate: every
+    existing reproduction script constructs this agent without a guard, so
+    their published numbers are unaffected, and "what happens with no
+    defense" stays measurable as the control condition.
+
+    Enforcement is kept SEPARATE from detection: this class knows nothing
+    about detectors or BlueVerdict. Callers wire a detector's decision in as
+    a guard if they want prevention, and the detector remains usable as a
+    pure classifier everywhere else.
+    """
+
+    def __init__(
+        self,
+        credential_store: Dict[str, Dict[str, Any]],
+        guard: Optional[Callable[[str, str], Optional[str]]] = None,
+    ) -> None:
+        self.credential_store = credential_store
+        self.guard = guard
+
+    def fulfill_request(
+        self, requested_user_id: str, session_user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Returns the requested credential record. With no `guard`, performs
+        NO independent re-verification that the caller is authorized to see
+        this specific user's data — the undefended baseline that reproduces
+        the paper's Vault Whisper result. With a `guard`, the check that PCAT's
+        P2 principle calls for happens here, before disclosure.
+
+        Raises BlockedExecution if the guard refuses."""
+        if self.guard is not None and session_user_id is not None:
+            reason = self.guard(session_user_id, requested_user_id)
+            if reason:
+                raise BlockedExecution(reason)
         return self.credential_store.get(requested_user_id)
 
 
@@ -202,7 +241,14 @@ class ShoppingAgent:
         )
         known_user_ids = list(credentials_provider.credential_store.keys())
         requested_user_id = _match_id_in_text(raw, known_user_ids) or session_user_id
-        record = credentials_provider.fulfill_request(requested_user_id)
+        # G6: propagate session identity so a guard (if any) can compare it
+        # against the requested identity BEFORE the record is released.
+        # BlockedExecution deliberately propagates to the caller rather than
+        # being swallowed here — simulate() must be able to tell "no data was
+        # exposed because the attack failed" apart from "no data was exposed
+        # because Blue stopped it", and silently returning None would erase
+        # that distinction.
+        record = credentials_provider.fulfill_request(requested_user_id, session_user_id=session_user_id)
         return record, raw, requested_user_id
 
 
