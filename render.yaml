@@ -1,0 +1,41 @@
+# Render blueprint — deploys docs/ as a free static site.
+#
+# The page is fully pre-built and committed (docs/index.html), so there is
+# nothing to compile at deploy time: buildCommand is a no-op. That is
+# deliberate. The site is self-contained — the trace snapshot is embedded in
+# the HTML and it makes no network requests at runtime — so a build step here
+# would only add Python dependencies, install time, and new ways to fail,
+# without changing a single byte that gets served.
+#
+# To regenerate the page after new experiment results, run the two builders
+# locally and commit the output; Render then serves whatever is committed:
+#   PYTHONPATH=. .venv/bin/python evaluation/export_site_data.py
+#   PYTHONPATH=. .venv/bin/python docs/build_site.py
+#
+# Usage: Render Dashboard -> New -> Blueprint -> pick this repo.
+services:
+  - type: web
+    runtime: static
+    name: agentic-commerce-fraud
+    branch: main
+    buildCommand: ""
+    staticPublishPath: ./docs
+    pullRequestPreviewsEnabled: true
+    headers:
+      # No inline-script CSP here on purpose: the page's interactivity is a
+      # single inline <script> plus an embedded JSON block, so a strict
+      # script-src would break the trace explorer. These are the headers that
+      # cost nothing and still matter for a public research page.
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+    routes:
+      # Anything unmatched falls back to the single page rather than Render's
+      # default 404 — the site is one document, so a stray path should land on
+      # it rather than a dead end.
+      - type: rewrite
+        source: /*
+        destination: /index.html
