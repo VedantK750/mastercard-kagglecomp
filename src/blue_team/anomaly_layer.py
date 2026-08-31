@@ -72,6 +72,31 @@ MINIMUM_MEANINGFUL: Dict[str, float] = {
 
 DEFAULT_ALPHA = 0.05  # target FAMILY-wise false-positive rate across all mechanisms
 
+# Multiplier on the scaled MAD for the small-sample robust bound. 3.0 is the
+# conventional outlier cut (~99.7th percentile for a normal, and MORE
+# conservative than that for the right-skewed distributions these mechanism
+# scores actually have, which is the direction we want).
+ROBUST_K = 3.0
+
+
+def _robust_upper_bound(values: List[float], k: float = ROBUST_K) -> float:
+    """median + k * 1.4826 * MAD — a stable upper bound that uses EVERY
+    sample instead of a single extreme order statistic, so it degrades
+    gracefully when the calibration set is small. 1.4826 rescales MAD to be
+    a consistent estimator of sigma under normality.
+
+    Falls back to the sample max when MAD is zero (a degenerate mechanism
+    like drift_fraction, which is identically 0.0 across every benign trace
+    this simulator produces) — in that case the MINIMUM_MEANINGFUL floor is
+    what actually governs, which is exactly its purpose."""
+    if not values:
+        return 0.0
+    med = statistics.median(values)
+    mad = statistics.median([abs(v - med) for v in values])
+    if mad <= 0:
+        return max(values)
+    return med + k * 1.4826 * mad
+
 
 class MechanismAnomalyLayer:
     """Calibrate on null traces, then score any trace by its largest
@@ -82,25 +107,53 @@ class MechanismAnomalyLayer:
         self.alpha = alpha
         self.thresholds: Dict[str, float] = {}
         self.n_calibration = 0
+        # False until calibrated with enough samples for the empirical
+        # quantile to be meaningful; surfaced so a caller/report can say so
+        # rather than quietly presenting a small-sample threshold as if it
+        # were a real 99th percentile.
+        self.sample_sufficient = False
 
     def calibrate(self, null_scores: List[Dict[str, float]]) -> None:
         """`null_scores` are mechanism_scores() dicts from ATTACK-FREE traces
         only. Passing anything attack-derived here defeats the entire point
         of this layer — callers are responsible for that filtering, and the
-        experiment harness asserts it."""
+        experiment harness asserts it.
+
+        SMALL-SAMPLE HANDLING. An empirical quantile cannot estimate the
+        q-th quantile from fewer than ~1/(1-q) samples: with m=6 mechanisms
+        and alpha=0.05, q=0.9917 needs n>=120, but the live loop was calling
+        this with 6 benign traces. `int(0.9917 * 6) = 5` simply returns the
+        MAXIMUM of 6 points, which underestimates the true quantile badly and
+        was the dominant cause of a measured ~13-20% null false-positive rate
+        (7 of 8 false flags came from this layer, not the classifier).
+
+        When the sample is too small, we fall back to a ROBUST estimator that
+        uses every point (median + k*MAD) rather than one extreme order
+        statistic, and take the larger of the two. Erring toward the higher
+        threshold is the correct direction: it costs recall on marginal
+        attacks rather than inventing false positives on benign users."""
         if not null_scores:
             return
         names = list(null_scores[0].keys())
         m = len(names)
         # Bonferroni: per-mechanism quantile so the FAMILY-wise rate is ~alpha
         q = 1.0 - (self.alpha / m)
+        n = len(null_scores)
+        sample_sufficient = n >= (1.0 / (1.0 - q))
+
         self.thresholds = {}
         for name in names:
             values = sorted(s[name] for s in null_scores)
             idx = min(len(values) - 1, int(q * len(values)))
             empirical = values[idx]
-            self.thresholds[name] = max(empirical, MINIMUM_MEANINGFUL.get(name, 0.0))
-        self.n_calibration = len(null_scores)
+
+            candidates = [empirical, MINIMUM_MEANINGFUL.get(name, 0.0)]
+            if not sample_sufficient:
+                candidates.append(_robust_upper_bound(values))
+            self.thresholds[name] = max(candidates)
+
+        self.n_calibration = n
+        self.sample_sufficient = sample_sufficient
 
     @property
     def is_calibrated(self) -> bool:

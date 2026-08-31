@@ -58,7 +58,7 @@ from src.red_team.intent_manipulation import DECOY_TECHNIQUES, IntentManipulatio
 from src.common.llm_client import get_call_count, get_call_count_by_model, reset_call_count
 from src.red_team.sequence_anomaly import PRESETS, SequenceAnomalyGenerator
 from src.red_team.vault_whisper import FRAMING_TECHNIQUES, VaultWhisperGenerator
-from evaluation.metrics import classification_metrics, confusion_breakdown
+from evaluation.metrics import classification_metrics, confusion_breakdown, wilson_ci
 
 # Overridable via env vars so a smoke run doesn't require editing this file —
 # e.g. AL_GENERATIONS=1 AL_POPULATION_SIZE=2 AL_ROUNDS_PER_GEN=1 for the
@@ -67,6 +67,11 @@ GENERATIONS = int(os.getenv("AL_GENERATIONS", "3"))
 POPULATION_SIZE = int(os.getenv("AL_POPULATION_SIZE", "3"))
 ROUNDS_PER_GEN = int(os.getenv("AL_ROUNDS_PER_GEN", "2"))
 N_BENIGN_PER_GEN = 3
+# Probe size for the strength/robustness sweep. 15 was far too small to
+# measure a ~5% false-positive rate: 1/15 and 3/15 both fall inside the same
+# 95% Wilson interval, so the sweep was reporting sampling noise as if it
+# were a 20% FPR. Free (no LLM calls) — there was no reason for it to be small.
+N_ROBUSTNESS_PROBE = int(os.getenv("AL_ROBUSTNESS_PROBE", "200"))
 TRAIN_FRACTION = 0.7
 
 TRACE_PATH = "traces/adaptive_loop_traces.jsonl"
@@ -88,6 +93,14 @@ CSV_FIELDS = [
 FLOOR_PER_SEGMENT_SEQUENCE = int(os.getenv("AL_FLOOR_SEQUENCE", "8"))
 FLOOR_PER_SEGMENT_REASONING = int(os.getenv("AL_FLOOR_REASONING", "6"))
 FLOOR_PER_SEGMENT_INTENT = int(os.getenv("AL_FLOOR_INTENT", "6"))
+
+# Attack-free traces generated purely to calibrate the one-class layer's
+# thresholds. The hybrid splits its FPR budget across two halves, so each
+# targets alpha/2 = 0.025; with m=6 mechanisms that is q=0.99583, needing
+# ~240 samples for the empirical quantile to be estimable at all rather than
+# collapsing to the sample maximum. Free: sequence_anomaly's benign path
+# makes no LLM calls.
+CALIBRATION_NULLS_SEQUENCE = int(os.getenv("AL_CALIBRATION_NULLS", "240"))
 
 
 def is_train(trace_id: str) -> bool:
@@ -178,6 +191,29 @@ _FLOOR_GRID = [
     (1.05, 1.05, 15), (1.15, 1.15, 12),  # upward variants — attacks aren't only drains
 ]
 _floor_grid_cursor = {"i": 0}
+
+
+def _calibration_batch(fam: "LearnableFamily", generation: int) -> List[AttackTrace]:
+    """Extra ATTACK-FREE traces for the one-class layer's threshold
+    calibration. Only generated for families whose benign path costs no LLM
+    calls — `sequence_anomaly` is fully deterministic, so 120 of these are
+    free, while the LLM families would cost real budget and are left with
+    whatever benign traces the run already produced (their small-sample
+    behavior is then handled by the robust-bound fallback in
+    anomaly_layer.calibrate)."""
+    if fam.family != "sequence_anomaly":
+        return []
+    gen = fam.generators[0]
+    seeds = gen.seed()
+    out: List[AttackTrace] = []
+    for i in range(CALIBRATION_NULLS_SEQUENCE):
+        ctx = dict(seeds[i % len(seeds)])          # span every spending profile
+        ctx["n_benign_continuation"] = (6, 15, 15)[i % 3]  # span attack-like lengths
+        t = gen.simulate(ctx, benign=True)
+        t.generation = generation
+        t.metadata["source"] = "calibration_null"
+        out.append(t)
+    return out
 
 
 def generate_sequence_segment(segment: str) -> Tuple[Dict[str, Any], AttackTrace, RedGenerator]:
@@ -349,9 +385,19 @@ def run_generation(
         # Kept strictly separate from fit(): this is what gives the detector
         # a floor against strategies Red's population has drifted away from
         # (or never produced), which a label-supervised boundary cannot have.
+        # Calibration set is deliberately SEPARATE from (and larger than) the
+        # train pool's benign slice. A Bonferroni-corrected 99.2nd percentile
+        # needs ~120+ samples to be estimable at all; the train pool carries
+        # ~6, which made the empirical quantile the sample MAXIMUM and drove a
+        # measured 13-20% false-positive rate on attack-free traces.
+        #
+        # Kept out of train_pool on purpose: this is calibration data for a
+        # layer that never sees labels, and dumping 100+ benign traces into
+        # the supervised pool would silently change its class balance too.
         null_train = [t for t in fam.train_pool if not t.ground_truth_label]
-        if null_train:
-            fam.detector.calibrate(null_train)
+        calibration = list(null_train) + _calibration_batch(fam, generation)
+        if calibration:
+            fam.detector.calibrate(calibration)
 
     recovered_case_c = sum(1 for t in case_c_before if fam.detector.evaluate(t).predicted_label)
 
@@ -558,7 +604,7 @@ def main() -> None:
         random.seed(2026083001)
         for mult in (0.85, 0.90, 0.92, 0.95, 0.97, 1.00):
             batch = []
-            for _ in range(15):
+            for _ in range(N_ROBUSTNESS_PROBE):
                 ctx = dict(probe_seed)
                 ctx["preset"] = "low_and_slow"
                 # BOTH levers move together. Sweeping amount while pinning
@@ -573,14 +619,17 @@ def main() -> None:
                 ctx["n_tail_txns"] = 15
                 batch.append(probe_gen.simulate(ctx, benign=False))
             verdicts = [sequence_anomaly.detector.evaluate(t) for t in batch]
-            rate = sum(1 for v in verdicts if v.predicted_label) / len(verdicts)
+            n_flag = sum(1 for v in verdicts if v.predicted_label)
+            rate = n_flag / len(verdicts)
+            lo, hi = wilson_ci(n_flag, len(verdicts))
             # At multiplier 1.00 BOTH levers are neutral, so this batch is a
             # pure NULL — statistically identical to benign, differing only in
             # tail length. Its flag rate is a FALSE-POSITIVE rate, not recall,
             # and labelling it "recall" would read as detection of an attack
             # that isn't there.
             label = "FPR (null control)" if mult >= 1.0 else "recall"
-            print(f"  amount_multiplier={mult:.2f}: {label}={rate:.2f} (n={len(verdicts)})")
+            print(f"  amount_multiplier={mult:.2f}: {label}={rate:.2f} "
+                  f"[{lo:.2f},{hi:.2f}] (n={len(verdicts)})")
     else:
         print("  sequence_anomaly detector never successfully fit this run — skipping robustness sweep")
     print(

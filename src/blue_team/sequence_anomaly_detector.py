@@ -204,9 +204,21 @@ class SequenceAnomalyDetector(Detector):
     family = "sequence_anomaly"
     trainable = True
 
+    # Family-wise false-positive budget, split across the two halves of the
+    # hybrid (supervised + one-class). Each half gets alpha/2 so the UNION
+    # lands near alpha — ORing two independently-5% detectors gives ~10%,
+    # which is what a measured null-control FPR of 10-20% actually was.
+    TARGET_FPR = float(__import__("os").getenv("BLUE_TARGET_FPR", "0.05"))
+
     def __init__(self) -> None:
         self._clf: Optional[LogisticRegression] = None
-        self._anomaly = MechanismAnomalyLayer()
+        # Decision threshold for the supervised half. sklearn's implicit 0.5
+        # is arbitrary for this problem: measured on a live run, genuinely
+        # attack-free traces scored up to P(attack)=0.89, so 0.5 flagged 10%
+        # of them. Real fraud systems pick an operating point against a
+        # false-positive budget instead, which is what calibrate() now does.
+        self._clf_threshold: float = 0.5
+        self._anomaly = MechanismAnomalyLayer(alpha=self.TARGET_FPR / 2)
 
     def mechanism_scores(self, trace: AttackTrace) -> Optional[Dict[str, float]]:
         """The five two-sided, baseline-normalized mechanism deviations
@@ -286,6 +298,10 @@ class SequenceAnomalyDetector(Detector):
         if len(set(y)) < 2:
             return  # degenerate pool this generation — keep whatever was fit before
         self._clf = LogisticRegression(class_weight="balanced").fit(X, y)
+        # Reset to the neutral default; calibrate() re-derives the operating
+        # point for THIS classifier. Without the reset a stale threshold from
+        # a previous generation's fit would silently carry over.
+        self._clf_threshold = 0.5
 
     def calibrate(self, null_traces: List[AttackTrace]) -> None:
         """Fit the one-class layer's thresholds on ATTACK-FREE traces only.
@@ -303,6 +319,25 @@ class SequenceAnomalyDetector(Detector):
         )
         scores = [self.mechanism_scores(t) for t in null_traces]
         self._anomaly.calibrate([s for s in scores if s is not None])
+
+        # Also set the SUPERVISED half's operating point from the same
+        # attack-free data. Note this uses only the null traces' predicted
+        # scores — no attack labels enter here, so it does not undermine the
+        # one-class property; it is choosing a threshold against a
+        # false-positive budget, which is how a deployed fraud detector is
+        # actually operated.
+        if self._clf is not None:
+            probs = sorted(
+                float(self._clf.predict_proba([self._features(t)[0]])[0][1])
+                for t in null_traces
+                if self._features(t) is not None
+            )
+            if probs:
+                q = 1.0 - (self.TARGET_FPR / 2)
+                idx = min(len(probs) - 1, int(q * len(probs)))
+                # Never go BELOW 0.5: this may only make the detector more
+                # conservative than sklearn's default, never more trigger-happy.
+                self._clf_threshold = max(0.5, probs[idx])
 
     def _legacy_heuristic_checks(self, trace: AttackTrace) -> Tuple[List[str], str]:
         """The pre-learning fixed-threshold rule, FROZEN — signed amount_z and
@@ -368,7 +403,9 @@ class SequenceAnomalyDetector(Detector):
             return verdict
         else:
             risk_score = float(self._clf.predict_proba([feats])[0][1])
-            predicted_label = bool(self._clf.predict([feats])[0])
+            # Calibrated operating point, not sklearn's implicit 0.5 — see
+            # _clf_threshold in __init__/calibrate().
+            predicted_label = risk_score >= self._clf_threshold
             # Display-only: name whichever mechanisms are large, so a verdict
             # is explainable. These do NOT drive predicted_label (the fitted
             # classifier does) — they're the reason string, and they feed
