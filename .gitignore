@@ -9,3 +9,4 @@ evaluation/results/*.csv
 evaluation/results/*.json
 *.egg-info/
 .DS_Store
+.~lock.*#
