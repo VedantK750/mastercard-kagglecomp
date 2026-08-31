@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from src.blue_team.sequence_anomaly_detector import MECHANISM_NAMES, SequenceAnomalyDetector
+from evaluation.adaptive_loop import is_train_trace
 from src.blue_team.unified_pipeline import make_detector, scenario_of, segment_of
 from src.common.schemas import AttackTrace
 from src.common.scoring import attack_succeeded
@@ -148,11 +149,42 @@ def _sequence_series(trace: AttackTrace) -> Dict[str, Any] | None:
 
 def build() -> None:
     traces = load_traces(TRACES)
+
+    # TWO detector conditions, because reporting only one was misleading.
+    #
+    # `detectors` are UNTRAINED: they run each family's Generation-0 heuristic,
+    # which is the honest "no learned defence yet" baseline. The site's trace
+    # explorer uses these, so a Case C shown next to a trace is a real miss by
+    # the starting detector rather than a verdict from a model that already
+    # trained on that trace.
+    #
+    # `trained` are fitted and calibrated on the traces the adaptive loop
+    # assigned to TRAIN, then evaluated only on TEST — matching how
+    # evaluation/adaptive_loop.py reports. Without this pair the headline
+    # counter read "24 Case C" while the README reported zero, because the two
+    # were silently measuring different things.
     detectors = {}
     verdicts = {}
     for t in traces:
         det = detectors.setdefault(t.family, make_detector(t.family))
         verdicts[t.trace_id] = det.evaluate(t)
+
+    train_pool = [t for t in traces if is_train_trace(t)]
+    test_pool = [t for t in traces if not is_train_trace(t)]
+    trained: Dict[str, Any] = {}
+    for fam in {t.family for t in traces}:
+        det = make_detector(fam)
+        fam_train = [t for t in train_pool if t.family == fam]
+        if getattr(det, "trainable", False) and fam_train:
+            det.fit(fam_train)
+            nulls = [t for t in fam_train if not t.ground_truth_label]
+            if nulls:
+                det.calibrate(nulls)
+        trained[fam] = det
+    trained_case_c = sum(
+        1 for t in test_pool
+        if _four_outcomes(t, trained[t.family].evaluate(t).predicted_label) == "case_c"
+    )
 
     # ---- curate: spread across families AND outcomes -----------------------
     by_family: Dict[str, List[AttackTrace]] = defaultdict(list)
@@ -218,8 +250,12 @@ def build() -> None:
             "n_traces": len(traces),
             "n_present": n_present,
             "n_succeeded": n_succeeded,
-            "n_case_c": n_case_c,
+            "n_case_c": n_case_c,                 # untrained baseline, all traces
+            "n_case_c_trained": trained_case_c,   # trained detectors, TEST split only
+            "n_test": len(test_pool),
             "families": len(by_family),
+            "attack_types": len({(t.family, t.sub_attack)
+                                 for t in traces if t.ground_truth_label}),
             "scenarios": sum(scen.values()),
             "by_family": {f: len(g) for f, g in by_family.items()},
             "scenarios_by_family": scen,

@@ -247,6 +247,7 @@ em{{color:var(--muted);font-style:normal;display:block;font-size:12.5px;margin-t
 .ctr b{{display:block;font:600 27px/1.1 var(--mono);letter-spacing:-.02em;font-variant-numeric:tabular-nums}}
 .ctr span{{font-size:12px;color:var(--muted)}}
 .ctr.alert b{{color:var(--danger)}}
+.ctr.good b{{color:var(--ok)}}
 
 /* matrix */
 .matrix{{border:1px solid var(--bd);border-radius:11px;overflow-x:auto;background:var(--panel)}}
@@ -372,12 +373,18 @@ footer{{padding:38px 0 56px;color:var(--muted);font-size:12.5px;border-top:1px s
   families, then built a defence that learns from what the attacker discovers.</p>
   <div class="counters">
     <div class="ctr"><b>{m['n_traces']}</b><span>attack traces generated</span></div>
-    <div class="ctr"><b>{m['families']}</b><span>attack families</span></div>
-    <div class="ctr"><b>{m['scenarios']}</b><span>distinct scenarios</span></div>
+    <div class="ctr"><b>{m['attack_types']}</b><span>attack types</span></div>
+    <div class="ctr"><b>{m['scenarios']}</b><span>scenarios exercised</span></div>
     <div class="ctr"><b>{m['n_present']}</b><span>attacks attempted</span></div>
     <div class="ctr"><b>{m['n_succeeded']}</b><span>actually succeeded</span></div>
-    <div class="ctr alert"><b>{m['n_case_c']}</b><span>Case C · harm undetected</span></div>
+    <div class="ctr alert"><b>{m['n_case_c']}</b><span>Case C before Blue learns</span></div>
+    <div class="ctr good"><b>{m['n_case_c_trained']}</b><span>Case C after Blue learns</span></div>
   </div>
+  <div class="note blue" style="margin-top:18px"><b>Those last two counters are the whole project in
+  one line.</b> Against the starting detector, {m['n_case_c']} attacks succeeded without being caught.
+  After Blue trains on what the attacker found, that count is {m['n_case_c_trained']} on a held-out
+  test split of {m['n_test']} traces the detector never trained on. Both numbers are measured the same
+  way; the difference is whether Blue was allowed to learn first.</div>
 </section>
 
 <section>
