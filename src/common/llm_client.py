@@ -25,10 +25,27 @@ visible output length or `chat()` silently returns "".
 from __future__ import annotations
 
 import os
+import random
+import time
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
+
+# Transient failures worth retrying. Deliberately NOT AuthenticationError or
+# BadRequestError: those are deterministic and retrying them just burns the
+# budget and hides a real bug. A single Gemini 500 mid-run previously killed
+# a full 3-generation experiment after ~40 successful calls, which is an
+# expensive way to learn the endpoint is occasionally flaky.
+_RETRYABLE = (InternalServerError, RateLimitError, APIConnectionError, APITimeoutError)
+MAX_RETRIES = 4
+BASE_BACKOFF_SECONDS = 1.5
 
 load_dotenv()
 
@@ -78,12 +95,34 @@ def chat(
     generation."""
     global _call_count
     client = get_client()
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+
+    last_error: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            break
+        except _RETRYABLE as exc:
+            last_error = exc
+            if attempt == MAX_RETRIES - 1:
+                raise
+            # Exponential backoff with jitter — jitter matters because the
+            # loop issues calls in tight bursts, so a fixed delay would
+            # synchronize every retry into the same next instant.
+            delay = BASE_BACKOFF_SECONDS * (2 ** attempt) * (0.5 + random.random())
+            print(f"  [llm_client] {type(exc).__name__} on attempt {attempt + 1}/{MAX_RETRIES}; "
+                  f"retrying in {delay:.1f}s")
+            time.sleep(delay)
+    else:  # pragma: no cover - defensive; the loop either breaks or raises
+        raise last_error  # type: ignore[misc]
+
+    # Counted AFTER success, so the budget reported by get_call_count()
+    # reflects calls that actually returned. Retries are visible in the log
+    # above rather than silently inflating the count.
     _call_count += 1
     _call_count_by_model[model] = _call_count_by_model.get(model, 0) + 1
     message = resp.choices[0].message
