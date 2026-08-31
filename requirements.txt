@@ -6,3 +6,4 @@ scikit-learn
 matplotlib
 jupyter
 python-dotenv
+python-docx
