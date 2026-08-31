@@ -5,6 +5,14 @@
 An end-to-end **Identify → Generate → Defend** system for GenAI-powered payment fraud, built on a
 faithful simulation of Google's **AP2 (Agent Payments Protocol)** four-agent architecture.
 
+### 🔗 Deliverables
+
+| | |
+|---|---|
+| **🌐 Live site** | **[agentic-commerce-fraud.onrender.com](https://agentic-commerce-fraud.onrender.com/)** — attack-surface matrix mapped onto the AP2 protocol, with a browsable explorer over real traces |
+| **📄 Solution walkthrough** | [`docs/Solution_Walkthrough.docx`](docs/Solution_Walkthrough.docx) — attacks identified, how they're generated, detection efficacy, real-world feasibility |
+| **📊 Results** | [§6 below](#6-results--key-findings) — every figure reproducible from `evaluation/` |
+
 > Detailed design and build history: [`PLAN.md`](PLAN.md) · [`OVERVIEW.md`](OVERVIEW.md)
 
 ---
@@ -559,9 +567,33 @@ evaluation/       adaptive_loop.py · generalization_suite.py · metrics.py
                   baseline_reproduction.py · phase2/3_reproduction.py · feature_validation*.py
 traces/           JSONL AttackTrace records (gitignored)
 
+docs/             index.html (the live site) · site_data.json (committed trace snapshot)
+                  build_site.py · build_walkthrough.py · Solution_Walkthrough.docx
+evaluation/       export_site_data.py (curates the snapshot the site reads)
+render.yaml       static-site blueprint for the live deployment
+
 docs/identify/    per-family taxonomy writeups            [in progress]
 notebooks/        per-phase + full-pipeline eval notebooks [in progress]
 ```
+
+### Rebuilding the deliverables
+
+The site and the walkthrough are both **generated**, never hand-edited, so they cannot drift from the
+results. `traces/` and `evaluation/results/` are gitignored, so the site reads a committed snapshot
+(`docs/site_data.json`) rather than live files — which is what lets it build from a fresh clone with
+no `.env` present.
+
+```bash
+PYTHONPATH=. .venv/bin/python evaluation/export_site_data.py   # refresh the snapshot
+PYTHONPATH=. .venv/bin/python docs/build_site.py               # rebuild the site
+PYTHONPATH=. .venv/bin/python docs/build_walkthrough.py        # rebuild the .docx
+```
+
+The page is fully self-contained — the trace data is embedded, it makes no network requests at
+runtime, and it needs no API key — so hosting is a static file drop (`render.yaml` deploys `docs/`;
+GitHub Pages works equally well from `main` / `/docs`). Live LLM generation is deliberately **not**
+served: it would put an API key on a server and be non-deterministic, so a visitor could run an attack
+and see a different result than the one we report.
 
 ### Setup
 
