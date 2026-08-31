@@ -277,23 +277,29 @@ exactly how far that goes — and it turns out to be a limit of *information*, n
 ### Red: seed → mutate → simulate → score → evolve
 
 ```
-seed()        paper-exact starting attack (Branded Whisper's directive, Vault Whisper's
-              cross-user request) — the reproduction baseline
+seed()        27 scenarios across 5 families, spanning spending profiles, price tiers,
+              categories and cadences. Seed 0 of each family is paper-exact and frozen,
+              so the reproductions stay anchored
     ↓
 mutate()      produce a variant. LLM families rewrite the adversarial text; deterministic
-              families nudge numeric levers. Feedback-driven: a caught round's specific
-              detection_reasons steer which lever moves next
+              families move numeric levers (amount, cadence, tail length, drift) within
+              clamped bounds. Feedback-driven: a caught round's specific detection_reasons
+              steer which lever moves next. A 15% chance of switching attack strategy
+              entirely, so a lineage is never locked into where it started
     ↓
 simulate()    run it through the real AP2 chain against a live LLM agent
     ↓
-score()       RedScore = intent_deviation × payment_impact × realism × novelty
+score()       RedScore = intent_deviation × log1p(payment_impact) × realism × novelty
                          − detection_probability
               Multiplicative on purpose: a zero-impact attack that evades perfectly still
-              scores ~0, which blocks the degenerate "never attack, never get caught" strategy
+              scores ~0, blocking the degenerate "never attack, never get caught" strategy.
+              log1p on impact stops transaction VOLUME dominating stealth (§6.3), and
+              realism is MEASURED against a benign profile, not a constant
     ↓
-memory        AttackMemoryStore dedups candidates and MEASURES novelty against everything
-              already tried — so "distinct evasions" is a real count, not the same
-              trajectory rediscovered five times
+memory        Two separate stores, because they want opposite things. Red's
+              AttackMemoryStore SUPPRESSES similarity (making novelty and "distinct
+              evasions" real counts); Blue's BlueReplayMemory ACCUMULATES it (training
+              coverage). Sharing one store was a bug that starved Blue's training pool
 ```
 
 Population search (`run_population_search`) runs a fixed population × rounds budget per generation
@@ -361,25 +367,82 @@ Different victim model (the paper's `gemini-2.5-flash` is no longer servable to 
 model-specific susceptibility differs sharply by attack type. **Product-ranking injection is
 comparatively well-defended in current models; identity/authorization reasoning is not.**
 
-### 6.2 Adaptive loop — 3 generations, 172 LLM calls
+### 6.2 Adaptive loop — 3 generations, 164 traces, 156 LLM calls
 
-| Gen | Family | Red ASR | Recall | FPR | **Case C** | F1 |
-|---|---|---|---|---|---|---|
-| 1 | reasoning_attack | 0.33 | 0.71 | 0.00 | **0** | 0.83 |
-| 2 | reasoning_attack | 0.33 | 0.60 | 0.00 | **0** | 0.75 |
-| 3 | reasoning_attack | 0.17 | 0.59 | 0.00 | **0** | 0.74 |
-| 1–3 | sequence_anomaly | 1.00 | 1.00 | 0.00 | **0** | 1.00 |
-| 1–3 | intent_manipulation | 0.00 | 0.25→0.36 | 0.00 | **0** | ~0.53 |
-| 1–3 | delegation_abuse *(control)* | 1.00 | 1.00 | 0.00 | **0** | 1.00 |
+| Gen | Family | Red ASR | Recall | FPR | **Case C** | F1 | Red reward |
+|---|---|---|---|---|---|---|---|
+| 1 | reasoning_attack | 0.08 | 0.00 | 0.00 | **0** | 0.00 | −0.03 |
+| 2 | reasoning_attack | 0.33 | 0.00 | 0.00 | **0** | 0.00 | −0.52 |
+| 3 | reasoning_attack | 0.17 | 0.00 | 0.00 | **0** | 0.00 | −0.51 |
+| 1 | intent_manipulation | 0.00 | 0.33 | 0.00 | **0** | 0.50 | 0.00 |
+| 2 | intent_manipulation | 0.00 | 0.67 | 0.00 | **0** | 0.80 | −0.75 |
+| 3 | intent_manipulation | 0.00 | **0.72** | 0.00 | **0** | 0.84 | −0.70 |
+| 1–3 | sequence_anomaly | 1.00→0.83 | **1.00** | 0.00 | **0** | **1.00** | −0.91 |
+| 1–3 | delegation_abuse *(control)* | 1.00 | 1.00 | 0.00 | **0** | 1.00 | n/a |
 
-**Zero Case C across every family and generation.** Two honest caveats: `intent_manipulation`'s Case C
-is trivially zero because *no attack ever succeeded* (§6.4), and the control family's flat 1.00 is the
-expected result that validates the harness rather than a defensive achievement.
+Zero Case C throughout, and Red's mean reward turns **sharply negative by generation 2–3** in every
+learnable family — the clearest single signal that Blue wins the in-distribution arms race.
 
-Red's mean reward went **strongly negative by generation 2–3** across all learnable families — the
-clearest single signal that Blue was winning the arms race in-distribution.
+**Four caveats, because the table flatters more than it should:**
 
-### 6.3 Generalization — three tiers that must never be conflated
+- `intent_manipulation`'s zero Case C is **trivial** — no attack ever succeeded (§6.6), so there was
+  nothing to miss.
+- `delegation_abuse`'s flat 1.00 is **true by construction** — it validates the harness, it is not a
+  defensive achievement.
+- `reasoning_attack` recall is **0.00** in the final generations on tiny test pools (n=2–3). Case C is
+  still zero because the few successes landed in the training split, not because Blue caught them.
+- Test pools are small throughout (n=1–19). Treat single-generation numbers as indicative only.
+
+### 6.3 Measurement-validity fixes (what changed and why it matters)
+
+A dedicated audit found nine architecture gaps. Several were **silently inflating results**:
+
+| Gap | Before | After |
+|---|---|---|
+| Red's `realism` reward term | hardcoded `0.85`/`0.9` — could not penalize anything | measured per family, range 0.70–1.00 |
+| `payment_impact` | grew linearly with transaction count | `log1p` saturation — marginal value falls +0.24 → +0.10 |
+| `attack_succeeded` (sequence, delegation) | `preset is not None` → **ASR 1.0 by construction** | real thresholds → **128 attempts, 54 successes (42%)** |
+| Seed scenarios | 5 total (n=1 per family) | **27 total**, 3–7 exercised live per family |
+| Red preset choice | one-way door — a lineage could never change strategy | 15% resampling; final mix 17/11/9 across all three |
+| Train/test split | per-trace (near-twin parents and children on opposite sides) | split on **lineage root** |
+| Blue enforcement | post-hoc only | pre-execution gate; delegation ASR **100% → 17%** under enforcement |
+
+**The reward exploit this closed, measured:** a CEM optimizer given a slightly wider search space
+converged on a 55-transaction "attack" at *normal* amounts (`amount_multiplier≈1.04`) — abandoning
+stealth entirely and scoring **5.6× a genuine attack**, because impact rewarded volume. Detection of
+that "attack" *fell* from 20% to 8% when Blue saw more benign data, because it genuinely was benign.
+
+### 6.4 False-positive control
+
+The null control (both attack levers neutral — statistically identical to benign) was reporting a 20%
+false-positive rate. Diagnosis found **two independent causes, one of them not real**:
+
+1. The one-class layer estimated a Bonferroni-corrected 99th percentile **from 6 samples** —
+   `int(0.9917 × 6) = 5` returns the sample *maximum*. 7 of 8 false flags came from this.
+2. The classifier used sklearn's implicit `0.5` threshold while genuinely benign traces scored up to
+   `P(attack)=0.89`.
+3. **The probe itself used n=15**, whose 95% CI is `[1%, 30%]` — it could not distinguish 5% from 20%.
+   It was reporting sampling noise as a false-positive rate.
+
+| Same detector, measured | Result |
+|---|---|
+| first 15 samples | 7% `[1%, 30%]` |
+| **n=300** | **4.0% `[2.3%, 6.9%]`** |
+
+Final sweep (n=200 per point, target FPR 5%):
+
+| amount multiplier | recall | 95% CI |
+|---|---|---|
+| 0.85 | 0.54 | [0.47, 0.60] |
+| 0.90 | 0.27 | [0.21, 0.33] |
+| 0.95 | 0.10 | [0.06, 0.14] |
+| **1.00 (null control)** | **FPR 0.04** | **[0.02, 0.08]** |
+
+**Tradeoff, stated plainly:** recall at 0.85 strength fell from ~72% to ~54%. That is *not* a
+regression — the earlier recall was partly bought with false positives nobody was counting. The
+operating point is now an explicit knob (`BLUE_TARGET_FPR`), not an accident of a library default.
+
+### 6.5 Generalization — three tiers that must never be conflated
 
 Conflating these is the easiest way to overclaim, and we did it once: a live run reported "13/15 on
 unseen low_and_slow" while a controlled run of the same question reported 0/13. The difference was
@@ -404,7 +467,7 @@ The one-class layer sidesteps this by never looking at attack labels — and rea
 both loud strategies it was never trained on**. The two halves are complementary (each wins a
 different tier), which is why the deployed detector combines them rather than choosing.
 
-### 6.4 Where attacks failed — and why that's a result
+### 6.6 Where attacks failed — and why that's a result
 
 | Finding | Evidence |
 |---|---|
@@ -412,7 +475,7 @@ different tier), which is why the deployed detector combines them rather than ch
 | **Keyword detection collapses under mutation** | The `[max_hits, total_hits]` feature is `[0,0]` for **18/18** Vault Whisper traces — it catches paper-exact prompts and nothing else once Red rewrites them |
 | **`identity_mismatch` eliminates every Vault Whisper Case C** | Attack success and identity mismatch are *the same event* by construction here — a structural fix, not a learned correlation |
 
-### 6.5 The low-and-slow blind spot is an *information* limit, not a detector limit
+### 6.7 The low-and-slow blind spot is an *information* limit, not a detector limit
 
 We chased this to the bottom. Closed-form statistical power analysis and measurement agree closely:
 
@@ -427,7 +490,7 @@ With only **8 baseline transactions**, an attack at multiplier ≤0.95 is below 
 any statistic whatsoever**. This is not a modelling failure — it is the signal-to-noise ratio of the
 observable history. Real payment systems have months of history, not 8 transactions.
 
-### 6.6 Measurement bugs we found and fixed
+### 6.8 Earlier measurement bugs found and fixed
 
 Each of these silently inflated or corrupted a result before it was caught:
 
@@ -453,8 +516,16 @@ Each of these silently inflated or corrupted a result before it was caught:
   controlled suites in `evaluation/` are more trustworthy than any single live run.
 - **One victim model.** All results are `gemini-3.1-flash-lite`. §6.1 shows susceptibility is strongly
   model-dependent, so these numbers should not be read as properties of "LLM agents" in general.
-- **Detection is post-hoc.** Every detector classifies a *completed* trace. Nothing in the simulator
-  can block a transaction, so we never claim harm was "prevented."
+- **Detection/prevention split is built but not yet the default.** A pre-execution gate exists
+  (credential guard, delegation authorizer) and works — delegation ASR drops 100% → 17% under
+  enforcement — but the adaptive loop still runs the undefended baseline by design, so the
+  headline numbers are still classification, not prevention.
+- **Detection is bought at a false-positive cost.** The operating point (`BLUE_TARGET_FPR`, default
+  5%) is now explicit and tunable rather than an accident of sklearn's 0.5 default, but §6.4's curve
+  shows the ROC is genuinely poor in this region: halving FPR roughly halves recall.
+- **`realism` is a guard rail, not an active gradient.** It correctly penalizes absurd attacks
+  (0.05–0.20) but sits at ~1.0 for essentially everything the current search bounds produce, so it
+  rarely influences selection in practice.
 - **Simplified environment.** No device fingerprints, geolocation, merchant reputation, or session
   signals — a real fraud system would have all of these.
 
@@ -463,7 +534,8 @@ Each of these silently inflated or corrupted a result before it was caught:
 1. **Raise baseline history** from 8 → 30–60 transactions. Power analysis predicts `low_and_slow`
    detection at multiplier 0.90 moves from ~18% → ~98%. **Highest value per unit of effort**, and it's
    a simulator-realism fix rather than a modelling one.
-2. **In-the-loop blocking** — let a Blue verdict gate an action, enabling a real "harm prevented" metric.
+2. **Make blocking the default** — the gate exists and is unit-tested; wiring it into the adaptive
+   loop turns "classified" into a real prevented-harm metric.
 3. **LLM strategist for Red** — an LLM proposes parameter deltas from attack memory; deterministic code
    clamps and executes them. Deliberately deferred until the mutation-based loop was proven.
 4. **Remaining families** — context poisoning, cross-agent injection, multi-agent propagation, composer.
@@ -475,11 +547,14 @@ Each of these silently inflated or corrupted a result before it was caught:
 ## 8. Repo Structure & Getting Started
 
 ```
-src/common/       schemas.py · ap2_env.py (4-agent AP2 sim) · llm_client.py
-                  scoring.py · feedback.py (AttackMemory) · memory.py (dedup + replay)
+src/common/       schemas.py · ap2_env.py (4-agent AP2 sim + pre-execution gate)
+                  llm_client.py (retry/backoff + call accounting) · scoring.py
+                  realism.py (measured plausibility) · feedback.py (AttackMemory)
+                  memory.py (Red dedup store + Blue replay store)
 src/red_team/     base.py · branded_whisper · vault_whisper · intent_manipulation
                   delegation_abuse · sequence_anomaly · evasion.py (population search)
 src/blue_team/    base.py · 4 detectors · anomaly_layer.py (one-class)
+                  unified_pipeline.py (family routing + scenario coverage)
 evaluation/       adaptive_loop.py · generalization_suite.py · metrics.py
                   baseline_reproduction.py · phase2/3_reproduction.py · feature_validation*.py
 traces/           JSONL AttackTrace records (gitignored)
@@ -502,7 +577,7 @@ echo "GEMINI_API_KEY=your_key_here" > .env      # never commit this file
 | `PYTHONPATH=. .venv/bin/python -m evaluation.baseline_reproduction` | Reproduces Branded + Vault Whisper vs. the paper's figures | ~40 |
 | `PYTHONPATH=. .venv/bin/python -m evaluation.phase2_reproduction` | Delegation abuse + intent manipulation | ~30 |
 | `PYTHONPATH=. .venv/bin/python -m evaluation.phase3_reproduction` | Sequence anomaly, all 3 presets | **0** |
-| `PYTHONPATH=. .venv/bin/python -m evaluation.adaptive_loop` | Full 3-generation Red↔Blue co-evolution | **~170** |
+| `PYTHONPATH=. .venv/bin/python -m evaluation.adaptive_loop` | Full 3-generation Red↔Blue co-evolution | **~156** |
 | `PYTHONPATH=. .venv/bin/python -m evaluation.generalization_suite` | Three-tier generalization study | **0** |
 | `PYTHONPATH=. .venv/bin/python -m evaluation.feature_validation` | Feature ablations on collected traces | **0** |
 
@@ -512,6 +587,15 @@ Every script prints its own LLM call count. The adaptive loop is configurable fo
 AL_GENERATIONS=1 AL_POPULATION_SIZE=2 AL_ROUNDS_PER_GEN=1 \
   PYTHONPATH=. .venv/bin/python -m evaluation.adaptive_loop
 ```
+
+Other knobs worth knowing:
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `BLUE_TARGET_FPR` | `0.05` | Blue's false-positive budget — sets the operating point (§6.4) |
+| `AL_CALIBRATION_NULLS` | `240` | Attack-free traces for one-class calibration (free, no LLM) |
+| `AL_ROBUSTNESS_PROBE` | `200` | Sample size for the strength sweep; below ~100 the CI is uselessly wide |
+| `AL_FLOOR_SEQUENCE/REASONING/INTENT` | `8`/`6`/`6` | Replay-floor coverage per segment |
 
 **Start here:** `evaluation/generalization_suite.py` — it costs nothing to run and contains the
 project's central scientific result.
